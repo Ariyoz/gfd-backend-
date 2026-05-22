@@ -19,7 +19,7 @@ router = APIRouter()
 async def get_feed(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
-    feed_type: str = Query("following", description="following, explore, or user"),
+    feed_type: str = Query("explore", description="following, explore, or user"),
     user_id: Optional[str] = Query(None, description="For user-specific feed"),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -27,7 +27,7 @@ async def get_feed(
     """Get feed — following, explore, or user-specific."""
     offset = (page - 1) * limit
 
-    if feed_type == "following":
+    if feed_type == "following" and user:
         # Get posts from followed users + own posts
         following_result = await db.execute(
             select(Follow.following_id).where(Follow.follower_id == user.id)
@@ -43,16 +43,6 @@ async def get_feed(
             .limit(limit)
         )
 
-    elif feed_type == "explore":
-        # Trending/popular posts
-        query = (
-            select(Post)
-            .where(Post.visibility == PostVisibility.PUBLIC)
-            .order_by(desc(Post.like_count + Post.comment_count), desc(Post.created_at))
-            .offset(offset)
-            .limit(limit)
-        )
-
     elif feed_type == "user" and user_id:
         # Specific user's posts
         query = (
@@ -63,6 +53,7 @@ async def get_feed(
             .limit(limit)
         )
     else:
+        # Explore/global feed — ALL public posts, newest first
         query = (
             select(Post)
             .where(Post.visibility == PostVisibility.PUBLIC)

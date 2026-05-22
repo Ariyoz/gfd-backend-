@@ -22,25 +22,86 @@ async def explore_developers(
     available_only: bool = Query(False),
     min_rate: Optional[float] = Query(None),
     max_rate: Optional[float] = Query(None),
+    search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Explore developers with smart filtering and ranking."""
-    filters = {}
-    if skills:
-        filters["skills"] = [s.strip() for s in skills.split(",")]
-    if location:
-        filters["location"] = location
-    if experience_level:
-        filters["experience_level"] = experience_level
-    if available_only:
-        filters["available_only"] = True
-    if min_rate:
-        filters["min_rate"] = min_rate
-    if max_rate:
-        filters["max_rate"] = max_rate
+    """Explore developers — automatically shows all developers who signed up."""
+    from sqlalchemy import select, desc, func, and_
+    from app.models import User, DeveloperProfile, Follow, UserRole, UserStatus
 
-    developers = await RecommendationService.get_trending_developers(db, limit=limit, filters=filters or None)
-    return {"developers": developers, "page": page, "total": len(developers)}
+    offset = (page - 1) * limit
+
+    # Base query — ALL active developers
+    query = (
+        select(User, DeveloperProfile)
+        .join(DeveloperProfile, DeveloperProfile.user_id == User.id)
+        .where(
+            and_(
+                User.role == UserRole.DEVELOPER,
+                User.status == UserStatus.ACTIVE,
+            )
+        )
+    )
+
+    # Apply filters
+    if search:
+        query = query.where(
+            User.full_name.ilike(f"%{search}%") |
+            User.username.ilike(f"%{search}%") |
+            DeveloperProfile.bio.ilike(f"%{search}%")
+        )
+    if skills:
+        skill_list = [s.strip() for s in skills.split(",")]
+        query = query.where(DeveloperProfile.skills.overlap(skill_list))
+    if location:
+        query = query.where(DeveloperProfile.location.ilike(f"%{location}%"))
+    if experience_level:
+        query = query.where(DeveloperProfile.experience_level == experience_level)
+    if available_only:
+        query = query.where(DeveloperProfile.available_for_hire == True)
+    if min_rate:
+        query = query.where(DeveloperProfile.hourly_rate >= min_rate)
+    if max_rate:
+        query = query.where(DeveloperProfile.hourly_rate <= max_rate)
+
+    # Get total count
+    count_query = select(func.count()).select_from(query.subquery())
+    total = (await db.execute(count_query)).scalar() or 0
+
+    # Order by most recent, then apply pagination
+    query = query.order_by(desc(User.created_at)).offset(offset).limit(limit)
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    developers = []
+    for user, profile in rows:
+        # Get follower count
+        fc = (await db.execute(
+            select(func.count()).where(Follow.following_id == user.id)
+        )).scalar() or 0
+
+        developers.append({
+            "id": str(user.id),
+            "username": user.username,
+            "full_name": user.full_name,
+            "avatar": user.avatar,
+            "bio": profile.bio,
+            "location": profile.location,
+            "skills": profile.skills or [],
+            "tech_stack": profile.tech_stack or [],
+            "experience_level": profile.experience_level,
+            "years_of_experience": profile.years_of_experience,
+            "hourly_rate": profile.hourly_rate,
+            "available_for_hire": profile.available_for_hire,
+            "github_url": profile.github_url,
+            "portfolio_url": profile.portfolio_url,
+            "follower_count": fc,
+            "is_verified": user.is_verified,
+            "created_at": str(user.created_at),
+        })
+
+    return {"developers": developers, "page": page, "total": total, "has_more": len(developers) == limit}
 
 
 @router.get("/search")
