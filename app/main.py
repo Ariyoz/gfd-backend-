@@ -71,27 +71,44 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
     user_id = payload.get("sub")
     await ws_manager.connect(websocket, user_id)
 
+    # Broadcast online status
+    from app.websocket.events import broadcast_event, EventType
+    await broadcast_event(EventType.USER_ONLINE, {"user_id": user_id})
+
     try:
         while True:
             data = await websocket.receive_json()
-            # Handle different message types
             msg_type = data.get("type")
 
-            if msg_type == "typing":
-                # Broadcast typing indicator to conversation participants
+            if msg_type == "typing_start":
                 await ws_manager.send_to_user(data.get("to"), {
-                    "type": "typing",
+                    "type": "typing_start",
+                    "from": user_id,
+                    "conversation_id": data.get("conversation_id"),
+                })
+
+            elif msg_type == "typing_stop":
+                await ws_manager.send_to_user(data.get("to"), {
+                    "type": "typing_stop",
                     "from": user_id,
                     "conversation_id": data.get("conversation_id"),
                 })
 
             elif msg_type == "message":
-                # Real-time message delivery
                 await ws_manager.send_to_user(data.get("to"), {
-                    "type": "new_message",
+                    "type": "message_sent",
                     "from": user_id,
                     "content": data.get("content"),
                     "conversation_id": data.get("conversation_id"),
+                    "timestamp": data.get("timestamp"),
+                })
+
+            elif msg_type == "message_read":
+                await ws_manager.send_to_user(data.get("to"), {
+                    "type": "message_read",
+                    "from": user_id,
+                    "conversation_id": data.get("conversation_id"),
+                    "message_id": data.get("message_id"),
                 })
 
             elif msg_type == "ping":
@@ -99,6 +116,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket, user_id)
+        await broadcast_event(EventType.USER_OFFLINE, {"user_id": user_id})
 
 
 # ── Health Check ──
