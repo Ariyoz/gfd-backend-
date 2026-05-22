@@ -14,7 +14,7 @@ router = APIRouter()
 
 @router.get("/conversations")
 async def get_conversations(user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Get all conversations for current user."""
+    """Get all conversations for current user with participant names."""
     result = await db.execute(
         select(ConversationParticipant)
         .where(ConversationParticipant.user_id == user.id)
@@ -28,7 +28,46 @@ async def get_conversations(user: User = Depends(get_current_active_user), db: A
     result = await db.execute(
         select(Conversation).where(Conversation.id.in_(conv_ids)).order_by(desc(Conversation.last_message_at))
     )
-    return {"conversations": result.scalars().all()}
+    conversations = result.scalars().all()
+
+    # Enrich with other participant's info
+    enriched = []
+    for conv in conversations:
+        # Get all participants in this conversation
+        parts_result = await db.execute(
+            select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv.id)
+        )
+        parts = parts_result.scalars().all()
+
+        # Find the OTHER participant (not current user)
+        other_user_id = None
+        for p in parts:
+            if p.user_id != user.id:
+                other_user_id = p.user_id
+                break
+
+        # Get other user's info
+        other_name = conv.name or "Conversation"
+        other_avatar = conv.avatar
+        if other_user_id:
+            other_result = await db.execute(select(User).where(User.id == other_user_id))
+            other_user = other_result.scalar_one_or_none()
+            if other_user:
+                other_name = other_user.full_name
+                other_avatar = other_user.avatar
+
+        enriched.append({
+            "id": str(conv.id),
+            "type": conv.type.value if conv.type else "direct",
+            "name": other_name,
+            "avatar": other_avatar,
+            "last_message_content": conv.last_message_content,
+            "last_message_at": conv.last_message_at,
+            "is_active": conv.is_active,
+            "other_user_id": str(other_user_id) if other_user_id else None,
+        })
+
+    return {"conversations": enriched}
 
 
 @router.post("/conversations")
@@ -69,7 +108,10 @@ async def get_messages(
 
 @router.post("/conversations/{conv_id}/messages")
 async def send_message(conv_id: str, data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Send a message."""
+    """Send a message — updates conversation and sends notification."""
+    from app.models import Notification, NotificationType
+    from sqlalchemy import update
+
     msg = Message(
         conversation_id=UUID(conv_id),
         sender_id=user.id,
@@ -78,5 +120,34 @@ async def send_message(conv_id: str, data: dict, user: User = Depends(get_curren
         media_url=data.get("media_url"),
     )
     db.add(msg)
+
+    # Update conversation last message
+    await db.execute(
+        update(Conversation)
+        .where(Conversation.id == UUID(conv_id))
+        .values(
+            last_message_content=data.get("content", "")[:100],
+            last_message_at=str(msg.created_at) if msg.created_at else None,
+        )
+    )
+
+    # Send notification to other participants
+    parts_result = await db.execute(
+        select(ConversationParticipant).where(
+            ConversationParticipant.conversation_id == UUID(conv_id),
+            ConversationParticipant.user_id != user.id,
+        )
+    )
+    for participant in parts_result.scalars().all():
+        db.add(Notification(
+            user_id=participant.user_id,
+            actor_id=user.id,
+            type=NotificationType.MESSAGE,
+            title=f"New message from {user.full_name}",
+            body=data.get("content", "")[:100],
+            data={"conversation_id": conv_id},
+            action_url="/messaging",
+        ))
+
     await db.flush()
     return {"id": str(msg.id), "message": "Message sent"}
