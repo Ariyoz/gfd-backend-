@@ -14,8 +14,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App code
 COPY . .
 
+# Make start script executable
+RUN chmod +x start.sh
+
 # Expose port
 EXPOSE 8000
 
-# Run with gunicorn + uvicorn workers
-CMD ["gunicorn", "app.main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]
+# Run migrations then start server
+CMD ["./start.sh"]
