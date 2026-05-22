@@ -177,53 +177,87 @@ async def github_login():
 async def github_callback(code: str, db: AsyncSession = Depends(get_db)):
     """Handle GitHub OAuth callback."""
     from app.integrations.github_oauth import exchange_github_code, get_github_user
-    token_data = await exchange_github_code(code)
-    github_user = await get_github_user(token_data["access_token"])
+    from fastapi.responses import RedirectResponse
+    import traceback
 
-    # Find or create user
-    result = await db.execute(
-        select(OAuthAccount).where(OAuthAccount.provider == "github", OAuthAccount.provider_user_id == str(github_user["id"]))
-    )
-    oauth = result.scalar_one_or_none()
+    frontend_url = "https://gdf-global-full-stack-developers.vercel.app"
 
-    if oauth:
-        user_result = await db.execute(select(User).where(User.id == oauth.user_id))
-        user = user_result.scalar_one()
-        oauth.access_token = token_data["access_token"]
-    else:
-        # Create new user
-        user = User(
-            email=github_user.get("email") or f"{github_user['login']}@github.oauth",
-            username=github_user["login"],
-            full_name=github_user.get("name") or github_user["login"],
-            avatar=github_user.get("avatar_url"),
-            role=UserRole.DEVELOPER,
-            status=UserStatus.ACTIVE,
-            is_verified=True,
+    try:
+        token_data = await exchange_github_code(code)
+        if "access_token" not in token_data:
+            return RedirectResponse(f"{frontend_url}/auth/login?error=github_token_failed")
+
+        github_user = await get_github_user(token_data["access_token"])
+
+        # Find or create user
+        result = await db.execute(
+            select(OAuthAccount).where(OAuthAccount.provider == "github", OAuthAccount.provider_user_id == str(github_user["id"]))
         )
-        db.add(user)
-        await db.flush()
+        oauth = result.scalar_one_or_none()
 
-        db.add(DeveloperProfile(user_id=user.id, github_url=github_user.get("html_url")))
-        db.add(OAuthAccount(
-            user_id=user.id,
-            provider="github",
-            provider_user_id=str(github_user["id"]),
-            access_token=token_data["access_token"],
-        ))
-        await db.flush()
+        if oauth:
+            user_result = await db.execute(select(User).where(User.id == oauth.user_id))
+            user = user_result.scalar_one()
+            oauth.access_token = token_data["access_token"]
+        else:
+            # Check if email already exists
+            email = github_user.get("email") or f"{github_user['login']}@github.oauth"
+            username = github_user["login"]
 
-    access_token = create_access_token(user.id, user.role.value)
-    refresh_token = create_refresh_token(user.id)
-    db.add(Session(user_id=user.id, refresh_token=refresh_token, expires_at="", is_active=True))
+            # Check for existing email
+            existing = await db.execute(select(User).where(User.email == email))
+            existing_user = existing.scalar_one_or_none()
 
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        token_type="bearer",
-        user_id=str(user.id),
-        role=user.role.value,
-    )
+            if existing_user:
+                # Link OAuth to existing user
+                user = existing_user
+                db.add(OAuthAccount(
+                    user_id=user.id,
+                    provider="github",
+                    provider_user_id=str(github_user["id"]),
+                    access_token=token_data["access_token"],
+                ))
+            else:
+                # Check for existing username, append number if taken
+                uname_check = await db.execute(select(User).where(User.username == username))
+                if uname_check.scalar_one_or_none():
+                    import time
+                    username = f"{username}_{int(time.time()) % 10000}"
+
+                user = User(
+                    email=email,
+                    username=username,
+                    full_name=github_user.get("name") or github_user["login"],
+                    avatar=github_user.get("avatar_url"),
+                    role=UserRole.DEVELOPER,
+                    status=UserStatus.ACTIVE,
+                    is_verified=True,
+                )
+                db.add(user)
+                await db.flush()
+
+                db.add(DeveloperProfile(user_id=user.id, github_url=github_user.get("html_url")))
+                db.add(OAuthAccount(
+                    user_id=user.id,
+                    provider="github",
+                    provider_user_id=str(github_user["id"]),
+                    access_token=token_data["access_token"],
+                ))
+
+            await db.flush()
+
+        access_token = create_access_token(user.id, user.role.value)
+        refresh_token = create_refresh_token(user.id)
+        db.add(Session(user_id=user.id, refresh_token=refresh_token, expires_at="", is_active=True))
+
+        # Redirect to frontend with tokens
+        return RedirectResponse(
+            f"{frontend_url}/auth/callback?access_token={access_token}&refresh_token={refresh_token}&user_id={user.id}&role={user.role.value}"
+        )
+
+    except Exception as e:
+        print(f"GitHub callback error: {traceback.format_exc()}")
+        return RedirectResponse(f"{frontend_url}/auth/login?error=github_failed")
 
 
 @router.get("/google/login")
@@ -243,49 +277,78 @@ async def google_login():
 async def google_callback(code: str, db: AsyncSession = Depends(get_db)):
     """Handle Google OAuth callback."""
     from app.integrations.google_oauth import exchange_google_code, get_google_user
-    token_data = await exchange_google_code(code)
-    google_user = await get_google_user(token_data["access_token"])
+    from fastapi.responses import RedirectResponse
+    import traceback
 
-    result = await db.execute(
-        select(OAuthAccount).where(OAuthAccount.provider == "google", OAuthAccount.provider_user_id == google_user["sub"])
-    )
-    oauth = result.scalar_one_or_none()
+    frontend_url = "https://gdf-global-full-stack-developers.vercel.app"
 
-    if oauth:
-        user_result = await db.execute(select(User).where(User.id == oauth.user_id))
-        user = user_result.scalar_one()
-    else:
-        username = google_user["email"].split("@")[0]
-        user = User(
-            email=google_user["email"],
-            username=username,
-            full_name=google_user.get("name", username),
-            avatar=google_user.get("picture"),
-            role=UserRole.DEVELOPER,
-            status=UserStatus.ACTIVE,
-            is_verified=True,
+    try:
+        token_data = await exchange_google_code(code)
+        google_user = await get_google_user(token_data["access_token"])
+
+        result = await db.execute(
+            select(OAuthAccount).where(OAuthAccount.provider == "google", OAuthAccount.provider_user_id == google_user["sub"])
         )
-        db.add(user)
-        await db.flush()
+        oauth = result.scalar_one_or_none()
 
-        db.add(DeveloperProfile(user_id=user.id))
-        db.add(OAuthAccount(
-            user_id=user.id,
-            provider="google",
-            provider_user_id=google_user["sub"],
-            access_token=token_data["access_token"],
-            refresh_token=token_data.get("refresh_token"),
-        ))
-        await db.flush()
+        if oauth:
+            user_result = await db.execute(select(User).where(User.id == oauth.user_id))
+            user = user_result.scalar_one()
+        else:
+            email = google_user["email"]
+            username = email.split("@")[0]
 
-    access_token = create_access_token(user.id, user.role.value)
-    refresh_token = create_refresh_token(user.id)
-    db.add(Session(user_id=user.id, refresh_token=refresh_token, expires_at="", is_active=True))
+            # Check if email already exists
+            existing = await db.execute(select(User).where(User.email == email))
+            existing_user = existing.scalar_one_or_none()
 
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        token_type="bearer",
-        user_id=str(user.id),
-        role=user.role.value,
-    )
+            if existing_user:
+                user = existing_user
+                db.add(OAuthAccount(
+                    user_id=user.id,
+                    provider="google",
+                    provider_user_id=google_user["sub"],
+                    access_token=token_data["access_token"],
+                    refresh_token=token_data.get("refresh_token"),
+                ))
+            else:
+                # Check for existing username
+                uname_check = await db.execute(select(User).where(User.username == username))
+                if uname_check.scalar_one_or_none():
+                    import time
+                    username = f"{username}_{int(time.time()) % 10000}"
+
+                user = User(
+                    email=email,
+                    username=username,
+                    full_name=google_user.get("name", username),
+                    avatar=google_user.get("picture"),
+                    role=UserRole.DEVELOPER,
+                    status=UserStatus.ACTIVE,
+                    is_verified=True,
+                )
+                db.add(user)
+                await db.flush()
+
+                db.add(DeveloperProfile(user_id=user.id))
+                db.add(OAuthAccount(
+                    user_id=user.id,
+                    provider="google",
+                    provider_user_id=google_user["sub"],
+                    access_token=token_data["access_token"],
+                    refresh_token=token_data.get("refresh_token"),
+                ))
+
+            await db.flush()
+
+        access_token = create_access_token(user.id, user.role.value)
+        refresh_token = create_refresh_token(user.id)
+        db.add(Session(user_id=user.id, refresh_token=refresh_token, expires_at="", is_active=True))
+
+        return RedirectResponse(
+            f"{frontend_url}/auth/callback?access_token={access_token}&refresh_token={refresh_token}&user_id={user.id}&role={user.role.value}"
+        )
+
+    except Exception as e:
+        print(f"Google callback error: {traceback.format_exc()}")
+        return RedirectResponse(f"{frontend_url}/auth/login?error=google_failed")
