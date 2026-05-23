@@ -25,25 +25,56 @@ async def list_projects(
     query = select(Project).order_by(desc(Project.created_at)).offset(offset).limit(limit)
     if status_filter:
         query = query.where(Project.status == ProjectStatus(status_filter))
-    else:
-        query = query.where(Project.status == ProjectStatus.OPEN)
+
     result = await db.execute(query)
-    return {"projects": result.scalars().all(), "page": page}
+    projects = result.scalars().all()
+
+    # Get total count
+    from sqlalchemy import func
+    count_result = await db.execute(select(func.count()).select_from(Project))
+    total = count_result.scalar() or 0
+
+    return {
+        "projects": [{
+            "id": str(p.id),
+            "title": p.title,
+            "description": p.description,
+            "requirements": p.requirements,
+            "skills_needed": p.skills_needed or [],
+            "budget_min": p.budget_min,
+            "budget_max": p.budget_max,
+            "budget_type": p.budget_type,
+            "duration": p.duration,
+            "project_type": p.project_type.value if p.project_type else "contract",
+            "experience_level": p.experience_level,
+            "status": p.status.value if p.status else "open",
+            "is_remote": p.is_remote,
+            "location": p.location,
+            "deadline": p.deadline,
+            "created_at": str(p.created_at),
+        } for p in projects],
+        "total": total,
+        "page": page,
+    }
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
-async def create_project(data: dict, user: User = Depends(require_client), db: AsyncSession = Depends(get_db)):
-    """Create a new project (client only)."""
-    # Get client profile
+async def create_project(data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Create a new project (any authenticated user)."""
+    # Get or create client profile for this user
     result = await db.execute(select(ClientProfile).where(ClientProfile.user_id == user.id))
     client_profile = result.scalar_one_or_none()
+
     if not client_profile:
-        raise HTTPException(status_code=400, detail="Client profile not found")
+        # Auto-create client profile for developers who want to post projects
+        client_profile = ClientProfile(user_id=user.id)
+        db.add(client_profile)
+        await db.flush()
 
     project = Project(
         client_id=client_profile.id,
         title=data["title"],
-        description=data["description"],
+        description=data.get("description", ""),
         requirements=data.get("requirements"),
         skills_needed=data.get("skills_needed", []),
         budget_min=data.get("budget_min"),
