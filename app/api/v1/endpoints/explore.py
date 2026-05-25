@@ -149,3 +149,43 @@ async def get_trending(db: AsyncSession = Depends(get_db)):
     trending_skills = [{"skill": row[0], "count": row[1]} for row in skills_result.fetchall()]
 
     return {"hashtags": hashtags, "skills": trending_skills}
+
+
+@router.get("/stats")
+async def get_platform_stats(db: AsyncSession = Depends(get_db)):
+    """Public platform stats — developer count, companies hiring, projects delivered."""
+    from sqlalchemy import select, func
+    from app.models import User, Project, UserRole, UserStatus, ClientProfile
+
+    # Count active developers
+    dev_count = (await db.execute(
+        select(func.count()).select_from(User).where(
+            User.role == UserRole.DEVELOPER,
+            User.status == UserStatus.ACTIVE,
+        )
+    )).scalar() or 0
+
+    # Count clients/companies hiring
+    client_count = (await db.execute(
+        select(func.count()).select_from(User).where(
+            User.role == UserRole.CLIENT,
+            User.status == UserStatus.ACTIVE,
+        )
+    )).scalar() or 0
+
+    # Count projects
+    project_count = (await db.execute(
+        select(func.count()).select_from(Project)
+    )).scalar() or 0
+
+    # Count total users
+    total_users = (await db.execute(
+        select(func.count()).select_from(User).where(User.status == UserStatus.ACTIVE)
+    )).scalar() or 0
+
+    return {
+        "developers": dev_count,
+        "companies_hiring": client_count,
+        "projects_delivered": project_count,
+        "total_users": total_users,
+    }
