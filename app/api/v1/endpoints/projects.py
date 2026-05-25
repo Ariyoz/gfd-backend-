@@ -18,14 +18,22 @@ async def list_projects(
     limit: int = Query(20, ge=1, le=100),
     status_filter: str = Query(None),
     skills: str = Query(None),
+    sort: str = Query("recent"),
     db: AsyncSession = Depends(get_db),
 ):
     """List open projects with filtering."""
     offset = (page - 1) * limit
-    query = select(Project).order_by(desc(Project.created_at)).offset(offset).limit(limit)
+    query = select(Project)
     if status_filter:
         query = query.where(Project.status == ProjectStatus(status_filter))
 
+    # Sort by trending (likes + views) or recent
+    if sort == "trending":
+        query = query.order_by(desc(Project.like_count + Project.view_count), desc(Project.created_at))
+    else:
+        query = query.order_by(desc(Project.created_at))
+
+    query = query.offset(offset).limit(limit)
     result = await db.execute(query)
     projects = result.scalars().all()
 
@@ -51,6 +59,8 @@ async def list_projects(
             "is_remote": p.is_remote,
             "location": p.location,
             "deadline": p.deadline,
+            "view_count": p.view_count or 0,
+            "like_count": p.like_count or 0,
             "created_at": str(p.created_at),
         } for p in projects],
         "total": total,
@@ -130,3 +140,23 @@ async def update_application_status(
         raise HTTPException(status_code=404, detail="Application not found")
     application.status = ApplicationStatus(data["status"])
     return {"message": f"Application {data['status']}"}
+
+
+@router.post("/{project_id}/like")
+async def like_project(project_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Like a project — increments like count."""
+    from sqlalchemy import update
+    await db.execute(
+        update(Project).where(Project.id == UUID(project_id)).values(like_count=Project.like_count + 1)
+    )
+    return {"message": "Project liked"}
+
+
+@router.post("/{project_id}/view")
+async def view_project(project_id: str, db: AsyncSession = Depends(get_db)):
+    """Record a project view — increments view count."""
+    from sqlalchemy import update
+    await db.execute(
+        update(Project).where(Project.id == UUID(project_id)).values(view_count=Project.view_count + 1)
+    )
+    return {"message": "View recorded"}

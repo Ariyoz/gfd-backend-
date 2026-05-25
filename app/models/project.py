@@ -53,6 +53,8 @@ class Project(BaseModel):
     is_remote = Column(Boolean, default=True)
     location = Column(String(150), nullable=True)
     deadline = Column(String(50), nullable=True)
+    view_count = Column(Integer, default=0)
+    like_count = Column(Integer, default=0)
 
     # Relationships
     client = relationship("ClientProfile", back_populates="projects")
