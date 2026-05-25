@@ -68,6 +68,49 @@ async def list_projects(
     }
 
 
+@router.get("/mine")
+async def list_my_projects(
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=100),
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List projects created by the current user."""
+    from sqlalchemy import func
+
+    # Find user's client profile
+    result = await db.execute(select(ClientProfile).where(ClientProfile.user_id == user.id))
+    client_profile = result.scalar_one_or_none()
+
+    if not client_profile:
+        return {"projects": [], "total": 0, "page": page}
+
+    offset = (page - 1) * limit
+    query = select(Project).where(Project.client_id == client_profile.id).order_by(desc(Project.created_at)).offset(offset).limit(limit)
+    result = await db.execute(query)
+    projects = result.scalars().all()
+
+    count_result = await db.execute(select(func.count()).select_from(Project).where(Project.client_id == client_profile.id))
+    total = count_result.scalar() or 0
+
+    return {
+        "projects": [{
+            "id": str(p.id),
+            "title": p.title,
+            "description": p.description,
+            "skills_needed": p.skills_needed or [],
+            "status": p.status.value if p.status else "open",
+            "project_type": p.project_type.value if p.project_type else "contract",
+            "deadline": p.deadline,
+            "view_count": p.view_count or 0,
+            "like_count": p.like_count or 0,
+            "created_at": str(p.created_at),
+        } for p in projects],
+        "total": total,
+        "page": page,
+    }
+
+
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_project(data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
     """Create a new project (any authenticated user)."""
