@@ -23,6 +23,28 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     # Startup
     print(f"🚀 GFD Backend v{settings.APP_VERSION} starting...")
+
+    # Auto-migrate: add missing columns
+    try:
+        from app.database.session import engine
+        from sqlalchemy import text
+        async with engine.begin() as conn:
+            # Add view_count and like_count to projects if not exists
+            await conn.execute(text("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='view_count') THEN
+                        ALTER TABLE projects ADD COLUMN view_count INTEGER DEFAULT 0;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='like_count') THEN
+                        ALTER TABLE projects ADD COLUMN like_count INTEGER DEFAULT 0;
+                    END IF;
+                END $$;
+            """))
+        print("✅ Database columns verified")
+    except Exception as e:
+        print(f"⚠️ Migration check: {e}")
+
     yield
     # Shutdown
     print("👋 GFD Backend shutting down...")
