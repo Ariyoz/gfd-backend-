@@ -151,3 +151,46 @@ async def send_message(conv_id: str, data: dict, user: User = Depends(get_curren
 
     await db.flush()
     return {"id": str(msg.id), "message": "Message sent"}
+
+
+@router.delete("/conversations/{conv_id}", status_code=204)
+async def delete_conversation(conv_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Delete a conversation (removes user from participants)."""
+    # Remove user from conversation participants
+    result = await db.execute(
+        select(ConversationParticipant).where(
+            ConversationParticipant.conversation_id == UUID(conv_id),
+            ConversationParticipant.user_id == user.id,
+        )
+    )
+    participant = result.scalar_one_or_none()
+    if participant:
+        await db.delete(participant)
+
+
+@router.delete("/messages/{message_id}", status_code=204)
+async def delete_message(message_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Delete a message (only own messages)."""
+    from sqlalchemy import update as sql_update
+    result = await db.execute(
+        select(Message).where(Message.id == UUID(message_id), Message.sender_id == user.id)
+    )
+    msg = result.scalar_one_or_none()
+    if msg:
+        msg.is_deleted = True
+        msg.content = "This message was deleted"
+
+
+@router.patch("/messages/{message_id}")
+async def edit_message(message_id: str, data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Edit a message (only own messages)."""
+    result = await db.execute(
+        select(Message).where(Message.id == UUID(message_id), Message.sender_id == user.id)
+    )
+    msg = result.scalar_one_or_none()
+    if not msg:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Message not found")
+    msg.content = data.get("content", msg.content)
+    msg.is_edited = True
+    return {"message": "Message updated"}
