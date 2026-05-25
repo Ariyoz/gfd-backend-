@@ -35,6 +35,7 @@ async def get_me(user: User = Depends(get_current_active_user), db: AsyncSession
         "follower_count": followers,
         "following_count": following,
         "post_count": post_count,
+        "created_at": str(user.created_at) if user.created_at else None,
     }
 
     # Add developer profile if exists
@@ -143,6 +144,7 @@ async def get_user(user_id: str, db: AsyncSession = Depends(get_db), current_use
         "following_count": following,
         "post_count": post_count,
         "is_following": is_following,
+        "created_at": str(user.created_at) if user.created_at else None,
     }
 
     # Developer profile
