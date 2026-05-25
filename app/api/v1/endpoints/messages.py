@@ -94,12 +94,12 @@ async def get_messages(
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get messages in a conversation."""
+    """Get messages in a conversation (oldest first for chat display)."""
     offset = (page - 1) * limit
     result = await db.execute(
         select(Message)
         .where(Message.conversation_id == UUID(conv_id))
-        .order_by(desc(Message.created_at))
+        .order_by(Message.created_at)
         .offset(offset)
         .limit(limit)
     )
