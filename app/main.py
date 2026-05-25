@@ -44,6 +44,23 @@ async def lifespan(app: FastAPI):
                     END IF;
                 END $$;
             """))
+            # Create project_likes and project_views tables if not exist
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS project_likes (
+                    id SERIAL PRIMARY KEY,
+                    project_id UUID NOT NULL,
+                    user_id UUID NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(project_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS project_views (
+                    id SERIAL PRIMARY KEY,
+                    project_id UUID NOT NULL,
+                    user_id UUID NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(project_id, user_id)
+                );
+            """))
         print("✅ Database columns verified")
     except Exception as e:
         print(f"⚠️ Migration check: {e}")

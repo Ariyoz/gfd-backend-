@@ -190,18 +190,53 @@ async def update_application_status(
 
 @router.post("/{project_id}/like")
 async def like_project(project_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Like a project — increments like count."""
-    from sqlalchemy import update
-    await db.execute(
-        update(Project).where(Project.id == UUID(project_id)).values(like_count=Project.like_count + 1)
-    )
-    return {"message": "Project liked"}
+    """Toggle like on a project — one like per user, can unlike."""
+    from sqlalchemy import update, text
+
+    # Check if user already liked this project
+    check = await db.execute(text(
+        "SELECT id FROM project_likes WHERE project_id = :pid AND user_id = :uid"
+    ), {"pid": project_id, "uid": str(user.id)})
+    existing = check.fetchone()
+
+    if existing:
+        # Unlike — remove the like
+        await db.execute(text(
+            "DELETE FROM project_likes WHERE project_id = :pid AND user_id = :uid"
+        ), {"pid": project_id, "uid": str(user.id)})
+        await db.execute(
+            update(Project).where(Project.id == UUID(project_id)).values(like_count=Project.like_count - 1)
+        )
+        return {"message": "Project unliked", "liked": False}
+    else:
+        # Like — add the like
+        await db.execute(text(
+            "INSERT INTO project_likes (project_id, user_id) VALUES (:pid, :uid)"
+        ), {"pid": project_id, "uid": str(user.id)})
+        await db.execute(
+            update(Project).where(Project.id == UUID(project_id)).values(like_count=Project.like_count + 1)
+        )
+        return {"message": "Project liked", "liked": True}
 
 
 @router.post("/{project_id}/view")
-async def view_project(project_id: str, db: AsyncSession = Depends(get_db)):
-    """Record a project view — increments view count."""
-    from sqlalchemy import update
+async def view_project(project_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Record a project view — one view per user."""
+    from sqlalchemy import update, text
+
+    # Check if user already viewed this project
+    check = await db.execute(text(
+        "SELECT id FROM project_views WHERE project_id = :pid AND user_id = :uid"
+    ), {"pid": project_id, "uid": str(user.id)})
+    existing = check.fetchone()
+
+    if existing:
+        return {"message": "Already viewed"}
+
+    # Record view
+    await db.execute(text(
+        "INSERT INTO project_views (project_id, user_id) VALUES (:pid, :uid)"
+    ), {"pid": project_id, "uid": str(user.id)})
     await db.execute(
         update(Project).where(Project.id == UUID(project_id)).values(view_count=Project.view_count + 1)
     )
