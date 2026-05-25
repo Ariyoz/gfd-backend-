@@ -61,6 +61,7 @@ async def list_projects(
             "deadline": p.deadline,
             "view_count": p.view_count or 0,
             "like_count": p.like_count or 0,
+            "cover_image": p.cover_image,
             "created_at": str(p.created_at),
         } for p in projects],
         "total": total,
@@ -104,6 +105,7 @@ async def list_my_projects(
             "deadline": p.deadline,
             "view_count": p.view_count or 0,
             "like_count": p.like_count or 0,
+            "cover_image": p.cover_image,
             "created_at": str(p.created_at),
         } for p in projects],
         "total": total,
@@ -134,6 +136,7 @@ async def create_project(data: dict, user: User = Depends(get_current_active_use
         budget_max=data.get("budget_max"),
         duration=data.get("duration"),
         experience_level=data.get("experience_level"),
+        cover_image=data.get("cover_image"),
     )
     db.add(project)
     await db.flush()

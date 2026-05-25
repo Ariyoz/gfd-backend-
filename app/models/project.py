@@ -55,6 +55,7 @@ class Project(BaseModel):
     deadline = Column(String(50), nullable=True)
     view_count = Column(Integer, default=0)
     like_count = Column(Integer, default=0)
+    cover_image = Column(Text, nullable=True)
 
     # Relationships
     client = relationship("ClientProfile", back_populates="projects")

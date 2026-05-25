@@ -39,6 +39,9 @@ async def lifespan(app: FastAPI):
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='like_count') THEN
                         ALTER TABLE projects ADD COLUMN like_count INTEGER DEFAULT 0;
                     END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='projects' AND column_name='cover_image') THEN
+                        ALTER TABLE projects ADD COLUMN cover_image TEXT;
+                    END IF;
                 END $$;
             """))
         print("✅ Database columns verified")
