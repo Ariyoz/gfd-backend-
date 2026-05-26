@@ -169,12 +169,14 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                         "call_type": data.get("call_type", "voice"),
                         "caller_name": data.get("caller_name", ""),
                         "caller_avatar": data.get("caller_avatar", ""),
+                        "offer": data.get("offer"),
                     })
 
             elif msg_type == "call_accept":
                 await ws_manager.send_to_user(data.get("to"), {
                     "type": "call_accepted",
                     "from": user_id,
+                    "answer": data.get("answer"),
                 })
 
             elif msg_type == "call_reject":
@@ -187,6 +189,13 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                 await ws_manager.send_to_user(data.get("to"), {
                     "type": "call_ended",
                     "from": user_id,
+                })
+
+            elif msg_type == "webrtc_ice":
+                await ws_manager.send_to_user(data.get("to"), {
+                    "type": "webrtc_ice",
+                    "from": user_id,
+                    "candidate": data.get("candidate"),
                 })
 
     except WebSocketDisconnect:
