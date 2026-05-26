@@ -49,18 +49,23 @@ async def get_conversations(user: User = Depends(get_current_active_user), db: A
         # Get other user's info
         other_name = conv.name or "Conversation"
         other_avatar = conv.avatar
+        other_online = False
         if other_user_id:
             other_result = await db.execute(select(User).where(User.id == other_user_id))
             other_user = other_result.scalar_one_or_none()
             if other_user:
                 other_name = other_user.full_name
                 other_avatar = other_user.avatar
+            # Check if user is online via WebSocket
+            from app.websocket import ws_manager
+            other_online = ws_manager.is_online(str(other_user_id))
 
         enriched.append({
             "id": str(conv.id),
             "type": conv.type.value if conv.type else "direct",
             "name": other_name,
             "avatar": other_avatar,
+            "online": other_online,
             "last_message_content": conv.last_message_content,
             "last_message_at": conv.last_message_at,
             "is_active": conv.is_active,
