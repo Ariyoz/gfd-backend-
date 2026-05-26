@@ -140,6 +140,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                 await ws_manager.send_to_user(data.get("to"), {
                     "type": "message_sent",
                     "from": user_id,
+                    "from_name": data.get("from_name", ""),
+                    "from_avatar": data.get("from_avatar", ""),
                     "content": data.get("content"),
                     "conversation_id": data.get("conversation_id"),
                     "timestamp": data.get("timestamp"),
@@ -158,13 +160,16 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
             # ── Call Signaling ──
             elif msg_type == "call_initiate":
-                await ws_manager.send_to_user(data.get("to"), {
-                    "type": "incoming_call",
-                    "from": user_id,
-                    "call_type": data.get("call_type", "voice"),
-                    "caller_name": data.get("caller_name", ""),
-                    "caller_avatar": data.get("caller_avatar", ""),
-                })
+                target = data.get("to")
+                print(f"[CALL] {user_id} calling {target} | Online: {ws_manager.is_online(target) if target else False}")
+                if target:
+                    await ws_manager.send_to_user(target, {
+                        "type": "incoming_call",
+                        "from": user_id,
+                        "call_type": data.get("call_type", "voice"),
+                        "caller_name": data.get("caller_name", ""),
+                        "caller_avatar": data.get("caller_avatar", ""),
+                    })
 
             elif msg_type == "call_accept":
                 await ws_manager.send_to_user(data.get("to"), {
