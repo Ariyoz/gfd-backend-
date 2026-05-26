@@ -156,6 +156,34 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
 
+            # ── Call Signaling ──
+            elif msg_type == "call_initiate":
+                await ws_manager.send_to_user(data.get("to"), {
+                    "type": "incoming_call",
+                    "from": user_id,
+                    "call_type": data.get("call_type", "voice"),
+                    "caller_name": data.get("caller_name", ""),
+                    "caller_avatar": data.get("caller_avatar", ""),
+                })
+
+            elif msg_type == "call_accept":
+                await ws_manager.send_to_user(data.get("to"), {
+                    "type": "call_accepted",
+                    "from": user_id,
+                })
+
+            elif msg_type == "call_reject":
+                await ws_manager.send_to_user(data.get("to"), {
+                    "type": "call_rejected",
+                    "from": user_id,
+                })
+
+            elif msg_type == "call_end":
+                await ws_manager.send_to_user(data.get("to"), {
+                    "type": "call_ended",
+                    "from": user_id,
+                })
+
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket, user_id)
         await broadcast_event(EventType.USER_OFFLINE, {"user_id": user_id})
