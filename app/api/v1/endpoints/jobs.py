@@ -82,26 +82,33 @@ async def list_jobs(
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_job(data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
     """Post a new job (clients/companies)."""
-    job = Job(
-        poster_id=user.id,
-        title=data["title"],
-        company=data.get("company", user.full_name),
-        company_logo=data.get("company_logo"),
-        description=data.get("description", ""),
-        requirements=data.get("requirements"),
-        responsibilities=data.get("responsibilities"),
-        skills_required=data.get("skills_required", []),
-        job_type=data.get("job_type", "full_time"),
-        experience_level=data.get("experience_level"),
-        location=data.get("location"),
-        is_remote=data.get("is_remote", True),
-        salary_min=data.get("salary_min"),
-        salary_max=data.get("salary_max"),
-        salary_currency=data.get("salary_currency", "USD"),
-    )
-    db.add(job)
-    await db.flush()
-    return {"id": str(job.id), "message": "Job posted successfully"}
+    try:
+        from sqlalchemy import text
+        # Use raw SQL to avoid ORM/enum issues with the auto-created table
+        result = await db.execute(text("""
+            INSERT INTO jobs (id, poster_id, title, company, description, requirements, skills_required, job_type, experience_level, location, is_remote, salary_min, salary_max, salary_currency, status, application_count, view_count, created_at, updated_at)
+            VALUES (gen_random_uuid(), :poster_id, :title, :company, :description, :requirements, :skills_required, :job_type, :experience_level, :location, :is_remote, :salary_min, :salary_max, :salary_currency, 'open', 0, 0, NOW(), NOW())
+            RETURNING id
+        """), {
+            "poster_id": str(user.id),
+            "title": data["title"],
+            "company": data.get("company") or user.full_name,
+            "description": data.get("description") or "",
+            "requirements": data.get("requirements"),
+            "skills_required": data.get("skills_required") or [],
+            "job_type": data.get("job_type") or "full_time",
+            "experience_level": data.get("experience_level"),
+            "location": data.get("location"),
+            "is_remote": data.get("is_remote", True),
+            "salary_min": data.get("salary_min"),
+            "salary_max": data.get("salary_max"),
+            "salary_currency": data.get("salary_currency") or "USD",
+        })
+        row = result.fetchone()
+        return {"id": str(row[0]) if row else None, "message": "Job posted successfully"}
+    except Exception as e:
+        print(f"[ERROR] Create job failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
 
 
 @router.get("/{job_id}")
