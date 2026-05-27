@@ -6,7 +6,7 @@ from sqlalchemy import select, desc, func
 from uuid import UUID
 
 from app.database import get_db
-from app.models import Job, JobApplication, JobStatus, JobApplicationStatus, User, Notification, NotificationType
+from app.models import Job, JobApplication, User, Notification, NotificationType
 from app.core.dependencies import get_current_active_user
 
 router = APIRouter()
@@ -24,7 +24,7 @@ async def list_jobs(
 ):
     """List open jobs with filtering."""
     offset = (page - 1) * limit
-    query = select(Job).where(Job.status == JobStatus.OPEN)
+    query = select(Job).where(Job.status == "open")
 
     if job_type:
         query = query.where(Job.job_type == job_type)
@@ -62,7 +62,7 @@ async def list_jobs(
             "requirements": job.requirements,
             "responsibilities": job.responsibilities,
             "skills_required": job.skills_required or [],
-            "job_type": job.job_type.value if job.job_type else "full_time",
+            "job_type": job.job_type or "full_time",
             "experience_level": job.experience_level,
             "location": job.location,
             "is_remote": job.is_remote,
@@ -128,7 +128,7 @@ async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
         "requirements": job.requirements,
         "responsibilities": job.responsibilities,
         "skills_required": job.skills_required or [],
-        "job_type": job.job_type.value if job.job_type else "full_time",
+        "job_type": job.job_type or "full_time",
         "experience_level": job.experience_level,
         "location": job.location,
         "is_remote": job.is_remote,

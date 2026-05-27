@@ -42,14 +42,14 @@ class Job(BaseModel):
     requirements = Column(Text, nullable=True)
     responsibilities = Column(Text, nullable=True)
     skills_required = Column(ARRAY(String), default=[])
-    job_type = Column(Enum(JobType), default=JobType.FULL_TIME, nullable=False)
-    experience_level = Column(String(50), nullable=True)  # junior, mid, senior, lead
+    job_type = Column(String(20), default="full_time", nullable=False)
+    experience_level = Column(String(50), nullable=True)
     location = Column(String(200), nullable=True)
     is_remote = Column(Boolean, default=True)
     salary_min = Column(Float, nullable=True)
     salary_max = Column(Float, nullable=True)
     salary_currency = Column(String(10), default="USD")
-    status = Column(Enum(JobStatus), default=JobStatus.OPEN, nullable=False, index=True)
+    status = Column(String(20), default="open", nullable=False, index=True)
     application_count = Column(Integer, default=0)
     view_count = Column(Integer, default=0)
 
@@ -70,8 +70,8 @@ class JobApplication(BaseModel):
     github_url = Column(Text, nullable=True)
     years_experience = Column(Integer, nullable=True)
     expected_salary = Column(Float, nullable=True)
-    availability = Column(String(100), nullable=True)  # "immediately", "2 weeks", "1 month"
-    status = Column(Enum(JobApplicationStatus), default=JobApplicationStatus.PENDING, nullable=False)
+    availability = Column(String(100), nullable=True)
+    status = Column(String(20), default="pending", nullable=False)
 
     # Relationships
     job = relationship("Job", back_populates="applications")
