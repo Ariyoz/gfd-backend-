@@ -144,14 +144,18 @@ async def get_all_subscriptions(
 ):
     """Get all subscriptions with user info."""
     from sqlalchemy import text
-    result = await db.execute(text("""
-        SELECT s.*, u.full_name, u.email, u.username, u.avatar, u.is_verified
-        FROM subscriptions s
-        LEFT JOIN users u ON u.id = s.user_id
-        WHERE s.status = :status
-        ORDER BY s.created_at DESC
-    """), {"status": status_filter})
-    rows = result.mappings().all()
+    try:
+        result = await db.execute(text("""
+            SELECT s.*, u.full_name, u.email, u.username, u.avatar, u.is_verified
+            FROM subscriptions s
+            LEFT JOIN users u ON u.id = s.user_id
+            WHERE s.status = :status
+            ORDER BY s.created_at DESC
+        """), {"status": status_filter})
+        rows = result.mappings().all()
+    except Exception as e:
+        print(f"[WARN] Admin subscriptions fetch: {e}")
+        return {"subscriptions": [], "total": 0}
 
     subs = []
     for row in rows:
@@ -160,7 +164,7 @@ async def get_all_subscriptions(
             "user_id": str(row["user_id"]),
             "user_name": row["full_name"] or "Unknown",
             "user_email": row["email"] or "",
-            "username": row["username"] or row.get("payment_reference") or "",
+            "username": row.get("payment_reference") or row.get("username") or "",
             "user_avatar": row["avatar"],
             "is_verified": row["is_verified"],
             "plan": row["plan"],
