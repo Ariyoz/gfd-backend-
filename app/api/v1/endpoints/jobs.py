@@ -288,11 +288,11 @@ async def get_job_applications(job_id: str, user: User = Depends(get_current_act
 @router.delete("/{job_id}")
 async def delete_job(job_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
     """Delete a job posting (only poster can delete)."""
-    result = await db.execute(select(Job).where(Job.id == UUID(job_id), Job.poster_id == user.id))
-    job = result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    await db.delete(job)
+    from sqlalchemy import text
+    result = await db.execute(text("DELETE FROM jobs WHERE id = :job_id AND poster_id = :user_id RETURNING id"), {"job_id": job_id, "user_id": str(user.id)})
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found or not authorized")
     return {"message": "Job deleted"}
 
 
