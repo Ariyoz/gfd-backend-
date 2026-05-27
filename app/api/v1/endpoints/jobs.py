@@ -250,36 +250,41 @@ async def apply_to_job(job_id: str, data: dict, user: User = Depends(get_current
 @router.get("/{job_id}/applications")
 async def get_job_applications(job_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
     """Get applications for a job (only job poster can see)."""
+    from sqlalchemy import text
+
     # Verify user is the poster
-    job_result = await db.execute(select(Job).where(Job.id == UUID(job_id)))
-    job = job_result.scalar_one_or_none()
-    if not job or job.poster_id != user.id:
+    job_check = await db.execute(text("SELECT poster_id FROM jobs WHERE id = :job_id"), {"job_id": job_id})
+    job_row = job_check.fetchone()
+    if not job_row or str(job_row[0]) != str(user.id):
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    result = await db.execute(
-        select(JobApplication).where(JobApplication.job_id == UUID(job_id)).order_by(desc(JobApplication.created_at))
-    )
-    applications = result.scalars().all()
+    # Get applications with applicant info
+    result = await db.execute(text("""
+        SELECT ja.*, u.full_name as applicant_name, u.avatar as applicant_avatar
+        FROM job_applications ja
+        LEFT JOIN users u ON u.id = ja.applicant_id
+        WHERE ja.job_id = :job_id
+        ORDER BY ja.created_at DESC
+    """), {"job_id": job_id})
+    rows = result.mappings().all()
 
     app_list = []
-    for app in applications:
-        applicant = await db.execute(select(User).where(User.id == app.applicant_id))
-        applicant_user = applicant.scalar_one_or_none()
+    for row in rows:
         app_list.append({
-            "id": str(app.id),
-            "applicant_name": applicant_user.full_name if applicant_user else "Unknown",
-            "applicant_avatar": applicant_user.avatar if applicant_user else None,
-            "applicant_id": str(app.applicant_id),
-            "cover_letter": app.cover_letter,
-            "resume_url": app.resume_url,
-            "portfolio_url": app.portfolio_url,
-            "linkedin_url": app.linkedin_url,
-            "github_url": app.github_url,
-            "years_experience": app.years_experience,
-            "expected_salary": app.expected_salary,
-            "availability": app.availability,
-            "status": app.status.value,
-            "created_at": str(app.created_at),
+            "id": str(row["id"]),
+            "applicant_name": row["applicant_name"] or "Unknown",
+            "applicant_avatar": row["applicant_avatar"],
+            "applicant_id": str(row["applicant_id"]),
+            "cover_letter": row.get("cover_letter"),
+            "resume_url": row.get("resume_url"),
+            "portfolio_url": row.get("portfolio_url"),
+            "linkedin_url": row.get("linkedin_url"),
+            "github_url": row.get("github_url"),
+            "years_experience": row.get("years_experience"),
+            "expected_salary": row.get("expected_salary"),
+            "availability": row.get("availability"),
+            "status": row.get("status") or "pending",
+            "created_at": str(row["created_at"]) if row.get("created_at") else "",
         })
 
     return {"applications": app_list, "total": len(app_list)}
