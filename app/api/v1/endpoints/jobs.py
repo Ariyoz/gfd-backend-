@@ -84,7 +84,52 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
     """Post a new job (clients/companies)."""
     try:
         from sqlalchemy import text
-        # Use raw SQL to avoid ORM/enum issues with the auto-created table
+
+        # Ensure table exists (in case auto-migration didn't run)
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                poster_id UUID NOT NULL,
+                title VARCHAR(300) NOT NULL,
+                company VARCHAR(200),
+                description TEXT NOT NULL DEFAULT '',
+                requirements TEXT,
+                skills_required TEXT[] DEFAULT '{}',
+                job_type VARCHAR(20) DEFAULT 'full_time',
+                experience_level VARCHAR(50),
+                location VARCHAR(200),
+                is_remote BOOLEAN DEFAULT TRUE,
+                salary_min FLOAT,
+                salary_max FLOAT,
+                salary_currency VARCHAR(10) DEFAULT 'USD',
+                status VARCHAR(20) DEFAULT 'open',
+                application_count INTEGER DEFAULT 0,
+                view_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS job_applications (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                job_id UUID NOT NULL,
+                applicant_id UUID NOT NULL,
+                cover_letter TEXT,
+                resume_url TEXT,
+                portfolio_url TEXT,
+                linkedin_url TEXT,
+                github_url TEXT,
+                years_experience INTEGER,
+                expected_salary FLOAT,
+                availability VARCHAR(100),
+                status VARCHAR(20) DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(job_id, applicant_id)
+            )
+        """))
+
+        # Insert the job
         result = await db.execute(text("""
             INSERT INTO jobs (id, poster_id, title, company, description, requirements, skills_required, job_type, experience_level, location, is_remote, salary_min, salary_max, salary_currency, status, application_count, view_count, created_at, updated_at)
             VALUES (gen_random_uuid(), :poster_id, :title, :company, :description, :requirements, :skills_required, :job_type, :experience_level, :location, :is_remote, :salary_min, :salary_max, :salary_currency, 'open', 0, 0, NOW(), NOW())
