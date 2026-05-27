@@ -59,11 +59,12 @@ async def get_my_subscription(user: User = Depends(get_current_active_user), db:
 
 @router.post("/subscribe")
 async def subscribe(data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Subscribe to a plan. For now, activates immediately (no real payment gateway).
-    In production, this would initiate a Paystack/Stripe checkout session.
+    """Submit a subscription payment. Creates a PENDING subscription that admin must approve.
+    User sends USDT, confirms with username, admin approves → verified badge granted.
     """
     plan = data.get("plan")
     billing_cycle = data.get("billing_cycle", "monthly")
+    username = data.get("username", "")
 
     if plan not in PLANS:
         raise HTTPException(status_code=400, detail="Invalid plan")
@@ -72,7 +73,7 @@ async def subscribe(data: dict, user: User = Depends(get_current_active_user), d
         # Downgrade to free — cancel active subscription
         await db.execute(text("""
             UPDATE subscriptions SET status = 'cancelled'
-            WHERE user_id = :user_id AND status = 'active'
+            WHERE user_id = :user_id AND status IN ('active', 'pending')
         """), {"user_id": str(user.id)})
 
         # Remove verified badge
@@ -82,38 +83,35 @@ async def subscribe(data: dict, user: User = Depends(get_current_active_user), d
 
         return {"message": "Downgraded to Free plan", "plan": "free", "is_verified": False}
 
-    # Cancel any existing active subscription
+    # Cancel any existing pending subscription (user re-submitting)
     await db.execute(text("""
         UPDATE subscriptions SET status = 'cancelled'
-        WHERE user_id = :user_id AND status = 'active'
+        WHERE user_id = :user_id AND status = 'pending'
     """), {"user_id": str(user.id)})
 
     # Calculate expiry
     interval = "1 month" if billing_cycle == "monthly" else "1 year"
 
-    # Create new subscription
+    # Create PENDING subscription — admin must approve
     await db.execute(text(f"""
-        INSERT INTO subscriptions (id, user_id, plan, billing_cycle, status, started_at, expires_at, created_at)
-        VALUES (gen_random_uuid(), :user_id, :plan, :billing_cycle, 'active', NOW(), NOW() + INTERVAL '{interval}', NOW())
+        INSERT INTO subscriptions (id, user_id, plan, billing_cycle, status, payment_reference, started_at, expires_at, created_at)
+        VALUES (gen_random_uuid(), :user_id, :plan, :billing_cycle, 'pending', :username, NOW(), NOW() + INTERVAL '{interval}', NOW())
     """), {
         "user_id": str(user.id),
         "plan": plan,
         "billing_cycle": billing_cycle,
+        "username": username or user.username or "",
     })
-
-    # Grant verified badge (purple tick) for Pro and Enterprise
-    await db.execute(text(
-        "UPDATE users SET is_verified = TRUE WHERE id = :user_id"
-    ), {"user_id": str(user.id)})
 
     price = PLANS[plan]["price_monthly"] if billing_cycle == "monthly" else PLANS[plan]["price_yearly"]
 
     return {
-        "message": f"Subscribed to {PLANS[plan]['name']} plan!",
+        "message": f"Payment submitted for {PLANS[plan]['name']}. Awaiting admin confirmation.",
         "plan": plan,
         "billing_cycle": billing_cycle,
         "price": price,
-        "is_verified": True,
+        "status": "pending",
+        "is_verified": False,
     }
 
 

@@ -138,14 +138,14 @@ async def delete_user(user_id: str, admin: User = Depends(require_admin), db: As
 
 @router.get("/subscriptions")
 async def get_all_subscriptions(
-    status_filter: str = Query("active"),
+    status_filter: str = Query("pending"),
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Get all subscriptions with user info."""
     from sqlalchemy import text
     result = await db.execute(text("""
-        SELECT s.*, u.full_name, u.email, u.avatar, u.is_verified
+        SELECT s.*, u.full_name, u.email, u.username, u.avatar, u.is_verified
         FROM subscriptions s
         LEFT JOIN users u ON u.id = s.user_id
         WHERE s.status = :status
@@ -160,6 +160,7 @@ async def get_all_subscriptions(
             "user_id": str(row["user_id"]),
             "user_name": row["full_name"] or "Unknown",
             "user_email": row["email"] or "",
+            "username": row["username"] or row.get("payment_reference") or "",
             "user_avatar": row["avatar"],
             "is_verified": row["is_verified"],
             "plan": row["plan"],
