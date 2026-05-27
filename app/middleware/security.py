@@ -1,26 +1,38 @@
-"""Security middleware — headers, request logging, request ID."""
+"""Security middleware — headers, request logging, request ID, rate limiting protection."""
 
 import uuid
 import time
 import logging
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse
 
 logger = logging.getLogger("gfd.middleware")
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Add security headers to all responses."""
+    """Add comprehensive security headers to all responses."""
 
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
+        # Prevent MIME sniffing
         response.headers["X-Content-Type-Options"] = "nosniff"
+        # Prevent clickjacking
         response.headers["X-Frame-Options"] = "DENY"
+        # XSS protection
         response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        # Force HTTPS
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
+        # Control referrer info
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        # Restrict browser features
+        response.headers["Permissions-Policy"] = "camera=(self), microphone=(self), geolocation=()"
+        # Content Security Policy
+        response.headers["Content-Security-Policy"] = "default-src 'self' https:; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; font-src 'self' https: data:; media-src 'self' https: blob:;"
+        # Prevent caching of sensitive data
+        if '/auth/' in request.url.path or '/admin/' in request.url.path:
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+            response.headers["Pragma"] = "no-cache"
         return response
 
 
@@ -43,6 +55,12 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         duration = round((time.time() - start) * 1000, 2)
 
+        # Log suspicious activity
+        if response.status_code in (401, 403, 429):
+            logger.warning(
+                f"SECURITY: {request.method} {request.url.path} → {response.status_code} from {request.client.host if request.client else 'unknown'}"
+            )
+
         logger.info(
             f"{request.method} {request.url.path} → {response.status_code} ({duration}ms)",
             extra={
@@ -54,3 +72,24 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             },
         )
         return response
+
+
+class InputSanitizationMiddleware(BaseHTTPMiddleware):
+    """Block common attack patterns in request paths."""
+
+    BLOCKED_PATTERNS = [
+        '../', '..\\', '<script', 'javascript:', 'onload=', 'onerror=',
+        'SELECT ', 'UNION ', 'DROP ', 'INSERT ', '--', ';--',
+        '/etc/passwd', '/proc/', 'cmd.exe', 'powershell',
+    ]
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path.lower()
+        query = str(request.url.query).lower()
+
+        for pattern in self.BLOCKED_PATTERNS:
+            if pattern.lower() in path or pattern.lower() in query:
+                logger.warning(f"BLOCKED: Suspicious request from {request.client.host}: {request.url}")
+                return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+
+        return await call_next(request)
