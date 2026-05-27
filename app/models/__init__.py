@@ -5,6 +5,7 @@ from .user import User, DeveloperProfile, ClientProfile, OAuthAccount, Session, 
 from .github import GitHubProfile, Repository
 from .social import Post, Comment, Like, Bookmark, Follow, Hashtag, BlockedUser, Report, PostType, PostVisibility
 from .project import Project, Application, ProjectStatus, ProjectType, ApplicationStatus
+from .job import Job, JobApplication, JobType, JobStatus, JobApplicationStatus
 from .messaging import Conversation, ConversationParticipant, Message, ConversationType
 from .notification import Notification, ActivityLog, AuditLog, NotificationType
 
@@ -14,6 +15,7 @@ __all__ = [
     "GitHubProfile", "Repository",
     "Post", "Comment", "Like", "Bookmark", "Follow", "Hashtag", "BlockedUser", "Report", "PostType", "PostVisibility",
     "Project", "Application", "ProjectStatus", "ProjectType", "ApplicationStatus",
+    "Job", "JobApplication", "JobType", "JobStatus", "JobApplicationStatus",
     "Conversation", "ConversationParticipant", "Message", "ConversationType",
     "Notification", "ActivityLog", "AuditLog", "NotificationType",
 ]
