@@ -328,6 +328,18 @@ async def repost(post_id: str, user: User = Depends(get_current_active_user), db
     await db.execute(update(Post).where(Post.id == pid).values(repost_count=Post.repost_count + 1))
     await db.flush()
 
+    # Notify original post author
+    if original_post.author_id != user.id:
+        from app.models import Notification, NotificationType
+        db.add(Notification(
+            user_id=original_post.author_id,
+            actor_id=user.id,
+            type=NotificationType.SYSTEM,
+            title=f"{user.full_name} reposted your post",
+            body=original_post.content[:80] if original_post.content else "",
+            action_url="/feed",
+        ))
+
     return {"id": str(repost.id), "message": "Reposted"}
 
 
