@@ -123,9 +123,8 @@ app = FastAPI(
 )
 
 # ── Middleware ──
-from app.middleware.security import SecurityHeadersMiddleware, RequestIDMiddleware, RequestLoggingMiddleware, InputSanitizationMiddleware
+from app.middleware.security import SecurityHeadersMiddleware, RequestIDMiddleware, RequestLoggingMiddleware
 
-app.add_middleware(InputSanitizationMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
