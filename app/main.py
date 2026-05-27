@@ -181,9 +181,17 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
     except Exception:
         pass
 
-    # Broadcast online status
+    # Broadcast online status to all other users
     from app.websocket.events import broadcast_event, EventType
     await broadcast_event(EventType.USER_ONLINE, {"user_id": user_id})
+
+    # Send list of currently online users to the newly connected user
+    online_users = [uid for uid in ws_manager.active_connections.keys() if uid != user_id]
+    if online_users:
+        await ws_manager.send_to_user(user_id, {
+            "type": "online_users",
+            "data": {"user_ids": online_users},
+        })
 
     try:
         while True:
