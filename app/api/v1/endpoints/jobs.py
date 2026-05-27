@@ -165,39 +165,40 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
 @router.get("/{job_id}")
 async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
     """Get job details."""
-    from sqlalchemy import update
-    # Increment view count
-    await db.execute(update(Job).where(Job.id == UUID(job_id)).values(view_count=Job.view_count + 1))
+    from sqlalchemy import text
 
-    result = await db.execute(select(Job).where(Job.id == UUID(job_id)))
-    job = result.scalar_one_or_none()
-    if not job:
+    # Increment view count
+    await db.execute(text("UPDATE jobs SET view_count = view_count + 1 WHERE id = :job_id"), {"job_id": job_id})
+
+    result = await db.execute(text("""
+        SELECT j.*, u.full_name as poster_name, u.avatar as poster_avatar
+        FROM jobs j LEFT JOIN users u ON u.id = j.poster_id
+        WHERE j.id = :job_id
+    """), {"job_id": job_id})
+    row = result.mappings().first()
+    if not row:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    poster = await db.execute(select(User).where(User.id == job.poster_id))
-    poster_user = poster.scalar_one_or_none()
-
     return {
-        "id": str(job.id),
-        "title": job.title,
-        "company": job.company,
-        "company_logo": job.company_logo,
-        "description": job.description,
-        "requirements": job.requirements,
-        "responsibilities": job.responsibilities,
-        "skills_required": job.skills_required or [],
-        "job_type": job.job_type or "full_time",
-        "experience_level": job.experience_level,
-        "location": job.location,
-        "is_remote": job.is_remote,
-        "salary_min": job.salary_min,
-        "salary_max": job.salary_max,
-        "salary_currency": job.salary_currency,
-        "application_count": job.application_count or 0,
-        "view_count": job.view_count or 0,
-        "poster_name": poster_user.full_name if poster_user else "Unknown",
-        "poster_avatar": poster_user.avatar if poster_user else None,
-        "created_at": str(job.created_at),
+        "id": str(row["id"]),
+        "title": row["title"],
+        "company": row["company"],
+        "description": row["description"] or "",
+        "requirements": row.get("requirements"),
+        "skills_required": row.get("skills_required") or [],
+        "job_type": row.get("job_type") or "full_time",
+        "experience_level": row.get("experience_level"),
+        "location": row.get("location"),
+        "is_remote": row.get("is_remote", True),
+        "salary_min": row.get("salary_min"),
+        "salary_max": row.get("salary_max"),
+        "salary_currency": row.get("salary_currency") or "USD",
+        "application_count": row.get("application_count") or 0,
+        "view_count": row.get("view_count") or 0,
+        "poster_name": row["poster_name"] or "Unknown",
+        "poster_avatar": row["poster_avatar"],
+        "created_at": str(row["created_at"]) if row.get("created_at") else "",
+    }
     }
 
 
