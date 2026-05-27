@@ -25,10 +25,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
         # Control referrer info
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        # Restrict browser features
-        response.headers["Permissions-Policy"] = "camera=(self), microphone=(self), geolocation=()"
-        # Content Security Policy
-        response.headers["Content-Security-Policy"] = "default-src 'self' https:; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; font-src 'self' https: data:; media-src 'self' https: blob:;"
+        # Restrict browser features (allow camera/mic for calls)
+        response.headers["Permissions-Policy"] = "geolocation=()"
+        # Content Security Policy - permissive for API
+        if not request.url.path.startswith('/api/'):
+            response.headers["Content-Security-Policy"] = "default-src 'self' https:; script-src 'self' 'unsafe-inline' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; font-src 'self' https: data:;"
         # Prevent caching of sensitive data
         if '/auth/' in request.url.path or '/admin/' in request.url.path:
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
@@ -75,21 +76,19 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 
 class InputSanitizationMiddleware(BaseHTTPMiddleware):
-    """Block common attack patterns in request paths."""
+    """Block common attack patterns in URL paths only (not request bodies)."""
 
-    BLOCKED_PATTERNS = [
-        '../', '..\\', '<script', 'javascript:', 'onload=', 'onerror=',
-        'SELECT ', 'UNION ', 'DROP ', 'INSERT ', '--', ';--',
-        '/etc/passwd', '/proc/', 'cmd.exe', 'powershell',
+    BLOCKED_PATH_PATTERNS = [
+        '../', '..\\', '/etc/passwd', '/proc/', 'cmd.exe', 'powershell',
+        '.env', 'wp-admin', 'phpinfo', '.git/',
     ]
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path.lower()
-        query = str(request.url.query).lower()
 
-        for pattern in self.BLOCKED_PATTERNS:
-            if pattern.lower() in path or pattern.lower() in query:
-                logger.warning(f"BLOCKED: Suspicious request from {request.client.host}: {request.url}")
+        for pattern in self.BLOCKED_PATH_PATTERNS:
+            if pattern.lower() in path:
+                logger.warning(f"BLOCKED: Suspicious path from {request.client.host}: {request.url.path}")
                 return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
         return await call_next(request)
