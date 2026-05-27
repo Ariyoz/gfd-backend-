@@ -55,6 +55,7 @@ class RealtimeService:
             "post_id": str(post.id),
             "liker_id": str(liker.id),
             "liker_name": liker.full_name,
+            "liker_avatar": liker.avatar,
             "like_count": post.like_count,
         }
 
@@ -75,6 +76,7 @@ class RealtimeService:
             "post_id": str(post.id),
             "commenter_id": str(commenter.id),
             "commenter_name": commenter.full_name,
+            "commenter_avatar": commenter.avatar,
             "content_preview": comment_content[:100],
             "comment_count": post.comment_count,
         }

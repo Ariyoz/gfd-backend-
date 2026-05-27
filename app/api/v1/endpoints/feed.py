@@ -185,11 +185,27 @@ async def get_post(post_id: str, db: AsyncSession = Depends(get_db)):
     author_result = await db.execute(select(User).where(User.id == post.author_id))
     author = author_result.scalar_one_or_none()
 
-    # Get comments
+    # Get comments with author info
     comments_result = await db.execute(
         select(Comment).where(Comment.post_id == post.id).order_by(Comment.created_at)
     )
     comments = comments_result.scalars().all()
+
+    # Enrich comments with author info
+    enriched_comments = []
+    for c in comments:
+        comment_author_result = await db.execute(select(User).where(User.id == c.author_id))
+        comment_author = comment_author_result.scalar_one_or_none()
+        enriched_comments.append({
+            "id": str(c.id),
+            "content": c.content,
+            "author_id": str(c.author_id),
+            "author_name": comment_author.full_name if comment_author else "User",
+            "author_avatar": comment_author.avatar if comment_author else None,
+            "parent_comment_id": str(c.parent_comment_id) if c.parent_comment_id else None,
+            "like_count": c.like_count,
+            "created_at": str(c.created_at),
+        })
 
     return {
         "post": {
@@ -209,14 +225,7 @@ async def get_post(post_id: str, db: AsyncSession = Depends(get_db)):
                 "avatar": author.avatar,
             } if author else None,
         },
-        "comments": [{
-            "id": str(c.id),
-            "content": c.content,
-            "author_id": str(c.author_id),
-            "parent_comment_id": str(c.parent_comment_id) if c.parent_comment_id else None,
-            "like_count": c.like_count,
-            "created_at": str(c.created_at),
-        } for c in comments],
+        "comments": enriched_comments,
     }
 
 

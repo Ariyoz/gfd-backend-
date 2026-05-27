@@ -1,12 +1,10 @@
-"""Jobs endpoints — LinkedIn-style job board."""
+"""Jobs endpoints — LinkedIn-style job board (all raw SQL for compatibility)."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, func
-from uuid import UUID
 
 from app.database import get_db
-from app.models import Job, JobApplication, User, Notification, NotificationType
+from app.models import User, Notification, NotificationType
 from app.core.dependencies import get_current_active_user
 
 router = APIRouter()
@@ -204,47 +202,52 @@ async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
 @router.post("/{job_id}/apply", status_code=status.HTTP_201_CREATED)
 async def apply_to_job(job_id: str, data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
     """Apply to a job with resume, portfolio, cover letter."""
-    from sqlalchemy import update
+    from sqlalchemy import text
 
     # Check if already applied
-    existing = await db.execute(
-        select(JobApplication).where(JobApplication.job_id == UUID(job_id), JobApplication.applicant_id == user.id)
-    )
-    if existing.scalar_one_or_none():
+    existing = await db.execute(text(
+        "SELECT id FROM job_applications WHERE job_id = :job_id AND applicant_id = :user_id"
+    ), {"job_id": job_id, "user_id": str(user.id)})
+    if existing.fetchone():
         raise HTTPException(status_code=400, detail="You have already applied to this job")
 
-    application = JobApplication(
-        job_id=UUID(job_id),
-        applicant_id=user.id,
-        cover_letter=data.get("cover_letter"),
-        resume_url=data.get("resume_url"),
-        portfolio_url=data.get("portfolio_url"),
-        linkedin_url=data.get("linkedin_url"),
-        github_url=data.get("github_url"),
-        years_experience=data.get("years_experience"),
-        expected_salary=data.get("expected_salary"),
-        availability=data.get("availability"),
-    )
-    db.add(application)
+    # Insert application
+    result = await db.execute(text("""
+        INSERT INTO job_applications (id, job_id, applicant_id, cover_letter, resume_url, portfolio_url, linkedin_url, github_url, years_experience, expected_salary, availability, status, created_at, updated_at)
+        VALUES (gen_random_uuid(), :job_id, :applicant_id, :cover_letter, :resume_url, :portfolio_url, :linkedin_url, :github_url, :years_experience, :expected_salary, :availability, 'pending', NOW(), NOW())
+        RETURNING id
+    """), {
+        "job_id": job_id,
+        "applicant_id": str(user.id),
+        "cover_letter": data.get("cover_letter"),
+        "resume_url": data.get("resume_url"),
+        "portfolio_url": data.get("portfolio_url"),
+        "linkedin_url": data.get("linkedin_url"),
+        "github_url": data.get("github_url"),
+        "years_experience": data.get("years_experience"),
+        "expected_salary": data.get("expected_salary"),
+        "availability": data.get("availability"),
+    })
+    app_row = result.fetchone()
 
     # Increment application count
-    await db.execute(update(Job).where(Job.id == UUID(job_id)).values(application_count=Job.application_count + 1))
+    await db.execute(text("UPDATE jobs SET application_count = application_count + 1 WHERE id = :job_id"), {"job_id": job_id})
 
     # Notify job poster
-    job_result = await db.execute(select(Job).where(Job.id == UUID(job_id)))
-    job = job_result.scalar_one_or_none()
-    if job:
+    job_result = await db.execute(text("SELECT poster_id, title FROM jobs WHERE id = :job_id"), {"job_id": job_id})
+    job_row = job_result.fetchone()
+    if job_row:
         db.add(Notification(
-            user_id=job.poster_id,
+            user_id=job_row[0],
             actor_id=user.id,
             type=NotificationType.SYSTEM,
             title=f"New application from {user.full_name}",
-            body=f"Applied to: {job.title}",
+            body=f"Applied to: {job_row[1]}",
             action_url=f"/dashboard/jobs",
         ))
 
     await db.flush()
-    return {"id": str(application.id), "message": "Application submitted successfully"}
+    return {"id": str(app_row[0]) if app_row else None, "message": "Application submitted successfully"}
 
 
 @router.get("/{job_id}/applications")
@@ -304,29 +307,38 @@ async def delete_job(job_id: str, user: User = Depends(get_current_active_user),
 @router.patch("/applications/{application_id}")
 async def update_application_status(application_id: str, data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
     """Update application status (shortlist, reject, accept)."""
-    result = await db.execute(select(JobApplication).where(JobApplication.id == UUID(application_id)))
-    application = result.scalar_one_or_none()
-    if not application:
+    from sqlalchemy import text
+
+    # Get application with job info
+    result = await db.execute(text("""
+        SELECT ja.*, j.poster_id, j.title as job_title
+        FROM job_applications ja
+        JOIN jobs j ON j.id = ja.job_id
+        WHERE ja.id = :app_id
+    """), {"app_id": application_id})
+    row = result.mappings().first()
+    if not row:
         raise HTTPException(status_code=404, detail="Application not found")
 
     # Verify the user is the job poster
-    job_result = await db.execute(select(Job).where(Job.id == application.job_id))
-    job = job_result.scalar_one_or_none()
-    if not job or job.poster_id != user.id:
+    if str(row["poster_id"]) != str(user.id):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     new_status = data.get("status")
     if new_status not in ["pending", "reviewed", "shortlisted", "accepted", "rejected"]:
         raise HTTPException(status_code=400, detail="Invalid status")
 
-    application.status = new_status
+    # Update status
+    await db.execute(text(
+        "UPDATE job_applications SET status = :status, updated_at = NOW() WHERE id = :app_id"
+    ), {"status": new_status, "app_id": application_id})
 
     # Notify the applicant
     db.add(Notification(
-        user_id=application.applicant_id,
+        user_id=row["applicant_id"],
         actor_id=user.id,
         type=NotificationType.SYSTEM,
-        title=f"Application update: {job.title}",
+        title=f"Application update: {row['job_title']}",
         body=f"Your application has been {new_status}",
         action_url="/jobs",
     ))
