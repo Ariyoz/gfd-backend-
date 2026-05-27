@@ -93,9 +93,13 @@ async def update_me(updates: dict, user: User = Depends(get_current_active_user)
         if dev_profile:
             for key, value in dev_updates.items():
                 setattr(dev_profile, key, value)
+        else:
+            # Create developer profile if it doesn't exist
+            dev_profile = DeveloperProfile(user_id=user.id, **dev_updates)
+            db.add(dev_profile)
 
     # Client profile fields
-    client_fields = {"company_name", "company_bio", "website", "industry"}
+    client_fields = {"company_name", "company_bio", "website", "industry", "location"}
     client_updates = {k: v for k, v in updates.items() if k in client_fields}
 
     if client_updates:
@@ -104,6 +108,10 @@ async def update_me(updates: dict, user: User = Depends(get_current_active_user)
         if client_profile:
             for key, value in client_updates.items():
                 setattr(client_profile, key, value)
+        else:
+            # Create client profile if it doesn't exist
+            client_profile = ClientProfile(user_id=user.id, **client_updates)
+            db.add(client_profile)
 
     # Broadcast profile update
     await RealtimeService.on_profile_updated(user.id, updates)
