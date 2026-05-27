@@ -116,16 +116,21 @@ async def get_messages(
 
 @router.post("/conversations/{conv_id}/messages")
 async def send_message(conv_id: str, data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Send a message — updates conversation and sends notification."""
+    """Send a message — saves to DB, sends WebSocket to recipient instantly, sends notification."""
     from app.models import Notification, NotificationType
     from sqlalchemy import update
+    from app.websocket import ws_manager
+
+    content = data.get("content", "")
+    msg_type = data.get("type", "text")
+    media_url = data.get("media_url")
 
     msg = Message(
         conversation_id=UUID(conv_id),
         sender_id=user.id,
-        content=data.get("content"),
-        message_type=data.get("type", "text"),
-        media_url=data.get("media_url"),
+        content=content,
+        message_type=msg_type,
+        media_url=media_url,
     )
     db.add(msg)
 
@@ -134,31 +139,51 @@ async def send_message(conv_id: str, data: dict, user: User = Depends(get_curren
         update(Conversation)
         .where(Conversation.id == UUID(conv_id))
         .values(
-            last_message_content=data.get("content", "")[:100],
+            last_message_content=content[:100],
             last_message_at=str(msg.created_at) if msg.created_at else None,
         )
     )
 
-    # Send notification to other participants
+    # Get other participants
     parts_result = await db.execute(
         select(ConversationParticipant).where(
             ConversationParticipant.conversation_id == UUID(conv_id),
             ConversationParticipant.user_id != user.id,
         )
     )
-    for participant in parts_result.scalars().all():
+    other_participants = parts_result.scalars().all()
+
+    await db.flush()
+    msg_id = str(msg.id)
+
+    # Send WebSocket event to each recipient IMMEDIATELY (before DB commit)
+    for participant in other_participants:
+        recipient_id = str(participant.user_id)
+        await ws_manager.send_to_user(recipient_id, {
+            "type": "message_sent",
+            "from": str(user.id),
+            "from_name": user.full_name,
+            "from_avatar": user.avatar or "",
+            "content": content,
+            "conversation_id": conv_id,
+            "message_id": msg_id,
+            "message_type": msg_type,
+            "media_url": media_url,
+            "timestamp": str(msg.created_at) if msg.created_at else None,
+        })
+
+        # Also create DB notification
         db.add(Notification(
             user_id=participant.user_id,
             actor_id=user.id,
             type=NotificationType.MESSAGE,
             title=f"New message from {user.full_name}",
-            body=data.get("content", "")[:100],
+            body=content[:100],
             data={"conversation_id": conv_id},
             action_url="/messaging",
         ))
 
-    await db.flush()
-    return {"id": str(msg.id), "message": "Message sent"}
+    return {"id": msg_id, "message": "Message sent"}
 
 
 @router.delete("/conversations/{conv_id}", status_code=204)
