@@ -132,3 +132,87 @@ async def delete_user(user_id: str, admin: User = Depends(require_admin), db: As
     await db.delete(user_to_delete)
     db.add(AuditLog(admin_id=admin.id, action="delete_user", target_type="user", target_id=UUID(user_id)))
     return {"message": "User deleted"}
+
+
+# ── Subscription Management ──
+
+@router.get("/subscriptions")
+async def get_all_subscriptions(
+    status_filter: str = Query("active"),
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all subscriptions with user info."""
+    from sqlalchemy import text
+    result = await db.execute(text("""
+        SELECT s.*, u.full_name, u.email, u.avatar, u.is_verified
+        FROM subscriptions s
+        LEFT JOIN users u ON u.id = s.user_id
+        WHERE s.status = :status
+        ORDER BY s.created_at DESC
+    """), {"status": status_filter})
+    rows = result.mappings().all()
+
+    subs = []
+    for row in rows:
+        subs.append({
+            "id": str(row["id"]),
+            "user_id": str(row["user_id"]),
+            "user_name": row["full_name"] or "Unknown",
+            "user_email": row["email"] or "",
+            "user_avatar": row["avatar"],
+            "is_verified": row["is_verified"],
+            "plan": row["plan"],
+            "billing_cycle": row["billing_cycle"],
+            "status": row["status"],
+            "started_at": str(row["started_at"]) if row["started_at"] else "",
+            "expires_at": str(row["expires_at"]) if row["expires_at"] else "",
+            "created_at": str(row.get("created_at", "")),
+        })
+
+    return {"subscriptions": subs, "total": len(subs)}
+
+
+@router.patch("/subscriptions/{sub_id}/approve")
+async def approve_subscription(sub_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Approve a subscription and grant verified badge."""
+    from sqlalchemy import text
+
+    # Get subscription
+    result = await db.execute(text("SELECT user_id FROM subscriptions WHERE id = :sub_id"), {"sub_id": sub_id})
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # Activate subscription
+    await db.execute(text("UPDATE subscriptions SET status = 'active' WHERE id = :sub_id"), {"sub_id": sub_id})
+
+    # Grant verified badge
+    await db.execute(text("UPDATE users SET is_verified = TRUE WHERE id = :user_id"), {"user_id": str(row[0])})
+
+    return {"message": "Subscription approved and verified badge granted"}
+
+
+@router.patch("/subscriptions/{sub_id}/revoke")
+async def revoke_subscription(sub_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Revoke a subscription and remove verified badge."""
+    from sqlalchemy import text
+
+    result = await db.execute(text("SELECT user_id FROM subscriptions WHERE id = :sub_id"), {"sub_id": sub_id})
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    await db.execute(text("UPDATE subscriptions SET status = 'cancelled' WHERE id = :sub_id"), {"sub_id": sub_id})
+    await db.execute(text("UPDATE users SET is_verified = FALSE WHERE id = :user_id"), {"user_id": str(row[0])})
+
+    return {"message": "Subscription revoked and verified badge removed"}
+
+
+@router.patch("/users/{user_id}/verify")
+async def toggle_user_verification(user_id: str, data: dict, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Manually verify/unverify a user (admin override)."""
+    verified = data.get("is_verified", True)
+    await db.execute(update(User).where(User.id == UUID(user_id)).values(is_verified=verified))
+    db.add(AuditLog(admin_id=admin.id, action="verify_user" if verified else "unverify_user", target_type="user", target_id=UUID(user_id)))
+    return {"message": f"User {'verified' if verified else 'unverified'}"}

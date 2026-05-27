@@ -15,8 +15,8 @@ router = APIRouter()
 # Plan definitions
 PLANS = {
     "free": {"name": "Free", "price_monthly": 0, "price_yearly": 0},
-    "pro": {"name": "Pro", "price_monthly": 19, "price_yearly": 15},
-    "enterprise": {"name": "Enterprise", "price_monthly": 79, "price_yearly": 63},
+    "pro_monthly": {"name": "Pro (Monthly)", "price_monthly": 7, "price_yearly": 84},
+    "pro_yearly": {"name": "Pro (Yearly)", "price_monthly": 5, "price_yearly": 60},
 }
 
 
