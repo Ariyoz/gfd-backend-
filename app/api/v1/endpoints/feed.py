@@ -310,21 +310,32 @@ async def remove_bookmark(post_id: str, user: User = Depends(get_current_active_
 
 @router.post("/{post_id}/repost", status_code=status.HTTP_201_CREATED)
 async def repost(post_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Repost a post."""
+    """Repost a post — one per user. If already reposted, unrepost."""
     pid = UUID(post_id)
+
+    # Check if already reposted
+    existing = await db.execute(select(Post).where(Post.author_id == user.id, Post.parent_post_id == pid))
+    existing_repost = existing.scalar_one_or_none()
+
+    if existing_repost:
+        # Unrepost
+        await db.delete(existing_repost)
+        await db.execute(update(Post).where(Post.id == pid).values(repost_count=Post.repost_count - 1))
+        return {"message": "Unreposted", "reposted": False}
+
     original = await db.execute(select(Post).where(Post.id == pid))
     original_post = original.scalar_one_or_none()
     if not original_post:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    repost = Post(
+    repost_post = Post(
         author_id=user.id,
         content=None,
         post_type=original_post.post_type,
         visibility=PostVisibility.PUBLIC,
         parent_post_id=pid,
     )
-    db.add(repost)
+    db.add(repost_post)
     await db.execute(update(Post).where(Post.id == pid).values(repost_count=Post.repost_count + 1))
     await db.flush()
 
@@ -340,7 +351,17 @@ async def repost(post_id: str, user: User = Depends(get_current_active_user), db
             action_url="/feed",
         ))
 
-    return {"id": str(repost.id), "message": "Reposted"}
+    return {"id": str(repost_post.id), "message": "Reposted", "reposted": True}
+
+
+@router.delete("/{post_id}/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_comment(post_id: str, comment_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Delete a comment (only comment author can delete)."""
+    result = await db.execute(select(Comment).where(Comment.id == UUID(comment_id), Comment.author_id == user.id))
+    comment = result.scalar_one_or_none()
+    if comment:
+        await db.delete(comment)
+        await db.execute(update(Post).where(Post.id == UUID(post_id)).values(comment_count=Post.comment_count - 1))
 
 
 @router.get("/bookmarks/me")
