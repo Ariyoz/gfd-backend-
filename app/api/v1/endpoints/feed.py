@@ -304,6 +304,22 @@ async def bookmark_post(post_id: str, user: User = Depends(get_current_active_us
         raise HTTPException(status_code=409, detail="Already bookmarked")
     db.add(Bookmark(user_id=user.id, post_id=pid))
     await db.execute(update(Post).where(Post.id == pid).values(bookmark_count=Post.bookmark_count + 1))
+    await db.flush()
+
+    # Notify post author via WebSocket
+    post_result = await db.execute(select(Post).where(Post.id == pid))
+    post = post_result.scalar_one_or_none()
+    if post and post.author_id != user.id:
+        from app.websocket import ws_manager
+        await ws_manager.send_to_user(str(post.author_id), {
+            "type": "post_bookmarked",
+            "data": {
+                "post_id": str(pid),
+                "bookmarker_name": user.full_name,
+                "bookmarker_avatar": user.avatar,
+            },
+        })
+
     return {"message": "Bookmarked"}
 
 
@@ -349,9 +365,10 @@ async def repost(post_id: str, user: User = Depends(get_current_active_user), db
     await db.execute(update(Post).where(Post.id == pid).values(repost_count=Post.repost_count + 1))
     await db.flush()
 
-    # Notify original post author
+    # Notify original post author via WebSocket + DB notification
     if original_post.author_id != user.id:
         from app.models import Notification, NotificationType
+        from app.websocket import ws_manager
         db.add(Notification(
             user_id=original_post.author_id,
             actor_id=user.id,
@@ -360,6 +377,15 @@ async def repost(post_id: str, user: User = Depends(get_current_active_user), db
             body=original_post.content[:80] if original_post.content else "",
             action_url="/feed",
         ))
+        # Send instant WebSocket notification
+        await ws_manager.send_to_user(str(original_post.author_id), {
+            "type": "post_reposted",
+            "data": {
+                "post_id": str(pid),
+                "reposter_name": user.full_name,
+                "reposter_avatar": user.avatar,
+            },
+        })
 
     return {"id": str(repost_post.id), "message": "Reposted", "reposted": True}
 
