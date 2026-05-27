@@ -104,6 +104,20 @@ async def lifespan(app: FastAPI):
                     UNIQUE(job_id, applicant_id)
                 );
             """))
+            # Create subscriptions table
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    plan VARCHAR(50) NOT NULL DEFAULT 'free',
+                    billing_cycle VARCHAR(20) DEFAULT 'monthly',
+                    status VARCHAR(20) DEFAULT 'active',
+                    payment_reference TEXT,
+                    started_at TIMESTAMP DEFAULT NOW(),
+                    expires_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """))
         print("✅ Database columns verified")
     except Exception as e:
         print(f"⚠️ Migration check: {e}")

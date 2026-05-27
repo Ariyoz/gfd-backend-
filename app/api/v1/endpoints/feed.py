@@ -100,6 +100,7 @@ async def get_feed(
                 "username": author.username if author else None,
                 "full_name": author.full_name if author else None,
                 "avatar": author.avatar if author else None,
+                "is_verified": author.is_verified if author else False,
             } if author else None,
         })
 
