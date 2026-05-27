@@ -199,7 +199,6 @@ async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
         "poster_avatar": row["poster_avatar"],
         "created_at": str(row["created_at"]) if row.get("created_at") else "",
     }
-    }
 
 
 @router.post("/{job_id}/apply", status_code=status.HTTP_201_CREATED)
