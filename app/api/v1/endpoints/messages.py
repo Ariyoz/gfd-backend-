@@ -56,9 +56,12 @@ async def get_conversations(user: User = Depends(get_current_active_user), db: A
             if other_user:
                 other_name = other_user.full_name
                 other_avatar = other_user.avatar
-            # Check if user is online via WebSocket
+                # Check online: WebSocket first, then DB field
+                other_online = other_user.is_online or False
+            # Also check WebSocket manager (more accurate for real-time)
             from app.websocket import ws_manager
-            other_online = ws_manager.is_online(str(other_user_id))
+            if ws_manager.is_online(str(other_user_id)):
+                other_online = True
 
         enriched.append({
             "id": str(conv.id),

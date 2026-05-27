@@ -176,10 +176,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
         from app.database.session import AsyncSessionLocal
         from sqlalchemy import text
         async with AsyncSessionLocal() as session:
-            await session.execute(text("UPDATE users SET is_online = TRUE WHERE id = :uid"), {"uid": user_id})
+            await session.execute(text("UPDATE users SET is_online = TRUE WHERE id = CAST(:uid AS UUID)"), {"uid": user_id})
             await session.commit()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] Failed to set online: {e}")
 
     # Broadcast online status to all other users
     from app.websocket.events import broadcast_event, EventType
@@ -281,9 +281,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             from app.database.session import AsyncSessionLocal
             from sqlalchemy import text
             async with AsyncSessionLocal() as session:
-                await session.execute(text("UPDATE users SET is_online = FALSE WHERE id = :uid"), {"uid": user_id})
+                await session.execute(text("UPDATE users SET is_online = FALSE WHERE id = CAST(:uid AS UUID)"), {"uid": user_id})
                 await session.commit()
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] Failed to set offline: {e}")
             pass
         await broadcast_event(EventType.USER_OFFLINE, {"user_id": user_id})
 
