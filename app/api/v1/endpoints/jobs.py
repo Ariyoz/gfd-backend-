@@ -236,3 +236,36 @@ async def delete_job(job_id: str, user: User = Depends(get_current_active_user),
         raise HTTPException(status_code=404, detail="Job not found")
     await db.delete(job)
     return {"message": "Job deleted"}
+
+
+@router.patch("/applications/{application_id}")
+async def update_application_status(application_id: str, data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Update application status (shortlist, reject, accept)."""
+    result = await db.execute(select(JobApplication).where(JobApplication.id == UUID(application_id)))
+    application = result.scalar_one_or_none()
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    # Verify the user is the job poster
+    job_result = await db.execute(select(Job).where(Job.id == application.job_id))
+    job = job_result.scalar_one_or_none()
+    if not job or job.poster_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    new_status = data.get("status")
+    if new_status not in ["pending", "reviewed", "shortlisted", "accepted", "rejected"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    application.status = new_status
+
+    # Notify the applicant
+    db.add(Notification(
+        user_id=application.applicant_id,
+        actor_id=user.id,
+        type=NotificationType.SYSTEM,
+        title=f"Application update: {job.title}",
+        body=f"Your application has been {new_status}",
+        action_url="/jobs",
+    ))
+
+    return {"message": f"Application {new_status}"}
