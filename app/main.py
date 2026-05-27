@@ -171,6 +171,16 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
     user_id = payload.get("sub")
     await ws_manager.connect(websocket, user_id)
 
+    # Update DB online status
+    try:
+        from app.database.session import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("UPDATE users SET is_online = TRUE WHERE id = :uid"), {"uid": user_id})
+            await session.commit()
+    except Exception:
+        pass
+
     # Broadcast online status
     from app.websocket.events import broadcast_event, EventType
     await broadcast_event(EventType.USER_ONLINE, {"user_id": user_id})
@@ -258,6 +268,15 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket, user_id)
+        # Update DB offline status
+        try:
+            from app.database.session import AsyncSessionLocal
+            from sqlalchemy import text
+            async with AsyncSessionLocal() as session:
+                await session.execute(text("UPDATE users SET is_online = FALSE WHERE id = :uid"), {"uid": user_id})
+                await session.commit()
+        except Exception:
+            pass
         await broadcast_event(EventType.USER_OFFLINE, {"user_id": user_id})
 
 
