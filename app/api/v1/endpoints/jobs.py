@@ -23,57 +23,63 @@ async def list_jobs(
     db: AsyncSession = Depends(get_db),
 ):
     """List open jobs with filtering."""
+    from sqlalchemy import text
+
     offset = (page - 1) * limit
-    query = select(Job).where(Job.status == "open")
+
+    # Build query
+    where_clauses = ["j.status = 'open'"]
+    params = {"limit": limit, "offset": offset}
 
     if job_type:
-        query = query.where(Job.job_type == job_type)
-    if experience_level:
-        query = query.where(Job.experience_level == experience_level)
+        where_clauses.append("j.job_type = :job_type")
+        params["job_type"] = job_type
     if is_remote is not None:
-        query = query.where(Job.is_remote == is_remote)
+        where_clauses.append("j.is_remote = :is_remote")
+        params["is_remote"] = is_remote
     if search:
-        query = query.where(
-            Job.title.ilike(f"%{search}%") |
-            Job.company.ilike(f"%{search}%") |
-            Job.description.ilike(f"%{search}%")
-        )
+        where_clauses.append("(j.title ILIKE :search OR j.company ILIKE :search OR j.description ILIKE :search)")
+        params["search"] = f"%{search}%"
+
+    where_sql = " AND ".join(where_clauses)
+
+    # Get jobs with poster info
+    result = await db.execute(text(f"""
+        SELECT j.*, u.full_name as poster_name, u.avatar as poster_avatar
+        FROM jobs j
+        LEFT JOIN users u ON u.id = j.poster_id
+        WHERE {where_sql}
+        ORDER BY j.created_at DESC
+        LIMIT :limit OFFSET :offset
+    """), params)
+    rows = result.mappings().all()
 
     # Count
-    count_query = select(func.count()).select_from(query.subquery())
-    total = (await db.execute(count_query)).scalar() or 0
+    count_result = await db.execute(text(f"SELECT COUNT(*) FROM jobs j WHERE {where_sql}"), params)
+    total = count_result.scalar() or 0
 
-    # Paginate
-    query = query.order_by(desc(Job.created_at)).offset(offset).limit(limit)
-    result = await db.execute(query)
-    jobs = result.scalars().all()
-
-    # Get poster info
     job_list = []
-    for job in jobs:
-        poster = await db.execute(select(User).where(User.id == job.poster_id))
-        poster_user = poster.scalar_one_or_none()
+    for row in rows:
         job_list.append({
-            "id": str(job.id),
-            "title": job.title,
-            "company": job.company or (poster_user.full_name if poster_user else "Company"),
-            "company_logo": job.company_logo or (poster_user.avatar if poster_user else None),
-            "description": job.description,
-            "requirements": job.requirements,
-            "responsibilities": job.responsibilities,
-            "skills_required": job.skills_required or [],
-            "job_type": job.job_type or "full_time",
-            "experience_level": job.experience_level,
-            "location": job.location,
-            "is_remote": job.is_remote,
-            "salary_min": job.salary_min,
-            "salary_max": job.salary_max,
-            "salary_currency": job.salary_currency,
-            "application_count": job.application_count or 0,
-            "view_count": job.view_count or 0,
-            "poster_name": poster_user.full_name if poster_user else "Unknown",
-            "poster_avatar": poster_user.avatar if poster_user else None,
-            "created_at": str(job.created_at),
+            "id": str(row["id"]),
+            "title": row["title"],
+            "company": row["company"] or row["poster_name"] or "Company",
+            "company_logo": row.get("company_logo") or row["poster_avatar"],
+            "description": row["description"] or "",
+            "requirements": row.get("requirements"),
+            "skills_required": row.get("skills_required") or [],
+            "job_type": row.get("job_type") or "full_time",
+            "experience_level": row.get("experience_level"),
+            "location": row.get("location"),
+            "is_remote": row.get("is_remote", True),
+            "salary_min": row.get("salary_min"),
+            "salary_max": row.get("salary_max"),
+            "salary_currency": row.get("salary_currency") or "USD",
+            "application_count": row.get("application_count") or 0,
+            "view_count": row.get("view_count") or 0,
+            "poster_name": row["poster_name"] or "Unknown",
+            "poster_avatar": row["poster_avatar"],
+            "created_at": str(row["created_at"]) if row.get("created_at") else "",
         })
 
     return {"jobs": job_list, "total": total, "page": page}
