@@ -26,14 +26,17 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Control referrer info
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         # Restrict browser features (allow camera/mic for calls)
-        response.headers["Permissions-Policy"] = "geolocation=()"
+        response.headers["Permissions-Policy"] = "geolocation=(), payment=()"
         # Content Security Policy - permissive for API
         if not request.url.path.startswith('/api/'):
-            response.headers["Content-Security-Policy"] = "default-src 'self' https:; script-src 'self' 'unsafe-inline' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; font-src 'self' https: data:;"
+            response.headers["Content-Security-Policy"] = "default-src 'self' https:; script-src 'self' 'unsafe-inline' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; font-src 'self' https: data:; media-src 'self' https: blob:;"
         # Prevent caching of sensitive data
         if '/auth/' in request.url.path or '/admin/' in request.url.path:
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
             response.headers["Pragma"] = "no-cache"
+        # Cross-Origin policies
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+        response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
         return response
 
 
@@ -59,11 +62,17 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         # Log suspicious activity
         if response.status_code in (401, 403, 429):
             logger.warning(
-                f"SECURITY: {request.method} {request.url.path} → {response.status_code} from {request.client.host if request.client else 'unknown'}"
+                f"SECURITY: {request.method} {request.url.path} -> {response.status_code} from {request.client.host if request.client else 'unknown'}"
+            )
+
+        # Log brute force attempts (multiple 401s)
+        if response.status_code == 401 and '/auth/' in request.url.path:
+            logger.warning(
+                f"AUTH_FAIL: {request.method} {request.url.path} from {request.client.host if request.client else 'unknown'}"
             )
 
         logger.info(
-            f"{request.method} {request.url.path} → {response.status_code} ({duration}ms)",
+            f"{request.method} {request.url.path} -> {response.status_code} ({duration}ms)",
             extra={
                 "method": request.method,
                 "path": request.url.path,
@@ -80,15 +89,17 @@ class InputSanitizationMiddleware(BaseHTTPMiddleware):
 
     BLOCKED_PATH_PATTERNS = [
         '../', '..\\', '/etc/passwd', '/proc/', 'cmd.exe', 'powershell',
-        '.env', 'wp-admin', 'phpinfo', '.git/',
+        '.env', 'wp-admin', 'phpinfo', '.git/', 'wp-login', 'xmlrpc',
+        'shell', 'eval(', 'exec(', '<script', 'javascript:',
     ]
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path.lower()
+        query = str(request.url.query).lower() if request.url.query else ""
 
         for pattern in self.BLOCKED_PATH_PATTERNS:
-            if pattern.lower() in path:
-                logger.warning(f"BLOCKED: Suspicious path from {request.client.host}: {request.url.path}")
+            if pattern.lower() in path or pattern.lower() in query:
+                logger.warning(f"BLOCKED: Suspicious request from {request.client.host}: {request.url}")
                 return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
         return await call_next(request)
