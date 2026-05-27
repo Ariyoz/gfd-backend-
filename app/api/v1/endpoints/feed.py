@@ -373,6 +373,37 @@ async def delete_comment(post_id: str, comment_id: str, user: User = Depends(get
         await db.execute(update(Post).where(Post.id == UUID(post_id)).values(comment_count=Post.comment_count - 1))
 
 
+@router.get("/{post_id}/comments")
+async def get_post_comments(post_id: str, db: AsyncSession = Depends(get_db)):
+    """Get all comments for a post with author info and threaded replies."""
+    pid = UUID(post_id)
+
+    # Get all comments for this post
+    comments_result = await db.execute(
+        select(Comment).where(Comment.post_id == pid).order_by(Comment.created_at)
+    )
+    comments = comments_result.scalars().all()
+
+    # Enrich with author info
+    enriched = []
+    for c in comments:
+        author_result = await db.execute(select(User).where(User.id == c.author_id))
+        author = author_result.scalar_one_or_none()
+        enriched.append({
+            "id": str(c.id),
+            "content": c.content,
+            "author_id": str(c.author_id),
+            "author_name": author.full_name if author else "User",
+            "author_username": author.username if author else "",
+            "author_avatar": author.avatar if author else None,
+            "parent_comment_id": str(c.parent_comment_id) if c.parent_comment_id else None,
+            "like_count": c.like_count,
+            "created_at": str(c.created_at),
+        })
+
+    return {"comments": enriched}
+
+
 @router.get("/bookmarks/me")
 async def get_my_bookmarks(
     page: int = Query(1, ge=1),
