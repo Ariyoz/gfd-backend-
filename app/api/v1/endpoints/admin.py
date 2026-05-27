@@ -34,6 +34,15 @@ async def get_analytics(user: User = Depends(require_admin), db: AsyncSession = 
     except:
         messages_count = 0
 
+    # Subscription stats
+    try:
+        from sqlalchemy import text as raw_text
+        pending_subs = (await db.execute(raw_text("SELECT COUNT(*) FROM subscriptions WHERE status = 'pending'"))).scalar() or 0
+        active_subs = (await db.execute(raw_text("SELECT COUNT(*) FROM subscriptions WHERE status = 'active'"))).scalar() or 0
+    except:
+        pending_subs = 0
+        active_subs = 0
+
     return {
         "total_users": users_count,
         "total_posts": posts_count,
@@ -44,6 +53,8 @@ async def get_analytics(user: User = Depends(require_admin), db: AsyncSession = 
         "suspended_users": suspended_count,
         "verified_users": verified_count,
         "total_messages": messages_count,
+        "pending_subscriptions": pending_subs,
+        "active_subscriptions": active_subs,
     }
 
 
