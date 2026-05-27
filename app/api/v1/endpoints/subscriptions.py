@@ -29,13 +29,16 @@ async def get_plans():
 @router.get("/my-subscription")
 async def get_my_subscription(user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
     """Get current user's subscription status."""
-    result = await db.execute(text("""
-        SELECT plan, billing_cycle, status, started_at, expires_at, payment_reference
-        FROM subscriptions
-        WHERE user_id = :user_id AND status = 'active'
-        ORDER BY created_at DESC LIMIT 1
-    """), {"user_id": str(user.id)})
-    row = result.mappings().first()
+    try:
+        result = await db.execute(text("""
+            SELECT plan, billing_cycle, status, started_at, expires_at, payment_reference
+            FROM subscriptions
+            WHERE user_id = :user_id AND status IN ('active', 'pending')
+            ORDER BY created_at DESC LIMIT 1
+        """), {"user_id": str(user.id)})
+        row = result.mappings().first()
+    except Exception:
+        row = None
 
     if not row:
         return {
@@ -59,9 +62,7 @@ async def get_my_subscription(user: User = Depends(get_current_active_user), db:
 
 @router.post("/subscribe")
 async def subscribe(data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Submit a subscription payment. Creates a PENDING subscription that admin must approve.
-    User sends USDT, confirms with username, admin approves → verified badge granted.
-    """
+    """Submit a subscription payment. Creates a PENDING subscription that admin must approve."""
     plan = data.get("plan")
     billing_cycle = data.get("billing_cycle", "monthly")
     username = data.get("username", "")
@@ -69,39 +70,65 @@ async def subscribe(data: dict, user: User = Depends(get_current_active_user), d
     if plan not in PLANS:
         raise HTTPException(status_code=400, detail="Invalid plan")
 
+    # Ensure table exists
+    try:
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID NOT NULL,
+                plan VARCHAR(50) NOT NULL DEFAULT 'free',
+                billing_cycle VARCHAR(20) DEFAULT 'monthly',
+                status VARCHAR(20) DEFAULT 'active',
+                payment_reference TEXT,
+                started_at TIMESTAMP DEFAULT NOW(),
+                expires_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+    except Exception:
+        pass
+
     if plan == "free":
         # Downgrade to free — cancel active subscription
-        await db.execute(text("""
-            UPDATE subscriptions SET status = 'cancelled'
-            WHERE user_id = :user_id AND status IN ('active', 'pending')
-        """), {"user_id": str(user.id)})
-
-        # Remove verified badge
-        await db.execute(text(
-            "UPDATE users SET is_verified = FALSE WHERE id = :user_id"
-        ), {"user_id": str(user.id)})
+        try:
+            await db.execute(text("""
+                UPDATE subscriptions SET status = 'cancelled'
+                WHERE user_id = :user_id AND status IN ('active', 'pending')
+            """), {"user_id": str(user.id)})
+            await db.execute(text(
+                "UPDATE users SET is_verified = FALSE WHERE id = :user_id"
+            ), {"user_id": str(user.id)})
+        except Exception:
+            pass
 
         return {"message": "Downgraded to Free plan", "plan": "free", "is_verified": False}
 
     # Cancel any existing pending subscription (user re-submitting)
-    await db.execute(text("""
-        UPDATE subscriptions SET status = 'cancelled'
-        WHERE user_id = :user_id AND status = 'pending'
-    """), {"user_id": str(user.id)})
+    try:
+        await db.execute(text("""
+            UPDATE subscriptions SET status = 'cancelled'
+            WHERE user_id = :user_id AND status = 'pending'
+        """), {"user_id": str(user.id)})
+    except Exception:
+        pass
 
     # Calculate expiry
     interval = "1 month" if billing_cycle == "monthly" else "1 year"
 
     # Create PENDING subscription — admin must approve
-    await db.execute(text(f"""
-        INSERT INTO subscriptions (id, user_id, plan, billing_cycle, status, payment_reference, started_at, expires_at, created_at)
-        VALUES (gen_random_uuid(), :user_id, :plan, :billing_cycle, 'pending', :username, NOW(), NOW() + INTERVAL '{interval}', NOW())
-    """), {
-        "user_id": str(user.id),
-        "plan": plan,
-        "billing_cycle": billing_cycle,
-        "username": username or user.username or "",
-    })
+    try:
+        await db.execute(text(f"""
+            INSERT INTO subscriptions (id, user_id, plan, billing_cycle, status, payment_reference, started_at, expires_at, created_at)
+            VALUES (gen_random_uuid(), :user_id, :plan, :billing_cycle, 'pending', :username, NOW(), NOW() + INTERVAL '{interval}', NOW())
+        """), {
+            "user_id": str(user.id),
+            "plan": plan,
+            "billing_cycle": billing_cycle,
+            "username": username or user.username or "",
+        })
+    except Exception as e:
+        print(f"[ERROR] Subscribe failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create subscription. Please try again.")
 
     price = PLANS[plan]["price_monthly"] if billing_cycle == "monthly" else PLANS[plan]["price_yearly"]
 
