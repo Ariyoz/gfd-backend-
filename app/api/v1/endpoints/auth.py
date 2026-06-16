@@ -180,7 +180,7 @@ async def github_callback(code: str, db: AsyncSession = Depends(get_db)):
     from fastapi.responses import RedirectResponse
     import traceback
 
-    frontend_url = "https://gdf-global-full-stack-developers.vercel.app"
+    frontend_url = "https://globalfd.xyz"
 
     try:
         token_data = await exchange_github_code(code)
@@ -280,7 +280,7 @@ async def google_callback(code: str, db: AsyncSession = Depends(get_db)):
     from fastapi.responses import RedirectResponse
     import traceback
 
-    frontend_url = "https://gdf-global-full-stack-developers.vercel.app"
+    frontend_url = "https://globalfd.xyz"
 
     try:
         token_data = await exchange_google_code(code)
