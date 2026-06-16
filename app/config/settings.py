@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8000
     SECRET_KEY: str = "change-me"
-    ALLOWED_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
+    ALLOWED_ORIGINS: str = "http://localhost:5173,http://localhost:3000,https://gdf-global-full-stack-developers.vercel.app,https://globalfd.xyz,https://www.globalfd.xyz"
 
     # ── Database ──
     DATABASE_URL: str = "postgresql+asyncpg://postgres:password@localhost:5432/gfd"
