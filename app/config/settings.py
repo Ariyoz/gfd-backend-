@@ -33,12 +33,12 @@ class Settings(BaseSettings):
     # ── OAuth: GitHub ──
     GITHUB_CLIENT_ID: str = ""
     GITHUB_CLIENT_SECRET: str = ""
-    GITHUB_REDIRECT_URI: str = "http://localhost:8000/api/v1/auth/github/callback"
+    GITHUB_REDIRECT_URI: str = "https://gfd-backend.onrender.com/api/v1/auth/github/callback"
 
     # ── OAuth: Google ──
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
-    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/v1/auth/google/callback"
+    GOOGLE_REDIRECT_URI: str = "https://gfd-backend.onrender.com/api/v1/auth/google/callback"
 
     # ── Cloudinary ──
     CLOUDINARY_CLOUD_NAME: str = ""
