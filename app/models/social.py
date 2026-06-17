@@ -14,6 +14,8 @@ class PostType(str, enum.Enum):
     VIDEO = "video"
     CODE = "code"
     POLL = "poll"
+    LINK = "link"
+    DOCUMENT = "document"
 
 
 class PostVisibility(str, enum.Enum):
@@ -30,11 +32,16 @@ class Post(BaseModel):
     post_type = Column(Enum(PostType), default=PostType.TEXT, nullable=False)
     visibility = Column(Enum(PostVisibility), default=PostVisibility.PUBLIC, nullable=False)
     media_urls = Column(ARRAY(Text), default=[])
+    video_url = Column(Text, nullable=True)        # Single video attachment
+    document_url = Column(Text, nullable=True)     # Single document (PDF)
+    document_name = Column(String(255), nullable=True)
     code_snippet = Column(Text, nullable=True)
     code_language = Column(String(50), nullable=True)
     poll_options = Column(JSONB, nullable=True)
     hashtags = Column(ARRAY(String), default=[])
     mentions = Column(ARRAY(UUID(as_uuid=True)), default=[])
+    # Link preview for the first URL in the post
+    link_preview = Column(JSONB, nullable=True)    # {url, title, description, image}
     like_count = Column(Integer, default=0)
     comment_count = Column(Integer, default=0)
     repost_count = Column(Integer, default=0)

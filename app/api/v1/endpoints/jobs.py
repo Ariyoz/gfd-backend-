@@ -1,4 +1,4 @@
-"""Jobs endpoints — LinkedIn-style job board (all raw SQL for compatibility)."""
+"""Jobs endpoints — upgraded with invites, real-time notifications, hiring chat initiation."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import User, Notification, NotificationType
 from app.core.dependencies import get_current_active_user
+from app.websocket import ws_manager
 
 router = APIRouter()
 
@@ -160,6 +161,47 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
         raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
 
 
+@router.get("/my-applications")
+async def get_my_applications(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all job applications submitted by the current user."""
+    from sqlalchemy import text
+
+    result = await db.execute(text("""
+        SELECT ja.*, j.title as job_title, j.company, j.job_type, j.location, j.is_remote,
+               u.full_name as poster_name, u.avatar as poster_avatar
+        FROM job_applications ja
+        JOIN jobs j ON j.id = ja.job_id
+        LEFT JOIN users u ON u.id = j.poster_id
+        WHERE ja.applicant_id = :user_id
+        ORDER BY ja.created_at DESC
+    """), {"user_id": str(user.id)})
+    rows = result.mappings().all()
+
+    return {
+        "applications": [
+            {
+                "id": str(row["id"]),
+                "job_id": str(row["job_id"]),
+                "job_title": row["job_title"],
+                "company": row["company"] or row["poster_name"] or "Company",
+                "job_type": row.get("job_type") or "full_time",
+                "location": row.get("location"),
+                "is_remote": row.get("is_remote", True),
+                "poster_name": row.get("poster_name"),
+                "poster_avatar": row.get("poster_avatar"),
+                "cover_letter": row.get("cover_letter"),
+                "status": row.get("status") or "pending",
+                "created_at": str(row["created_at"]) if row.get("created_at") else "",
+            }
+            for row in rows
+        ],
+        "total": len(rows),
+    }
+
+
 @router.get("/{job_id}")
 async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
     """Get job details."""
@@ -304,6 +346,76 @@ async def delete_job(job_id: str, user: User = Depends(get_current_active_user),
     return {"message": "Job deleted"}
 
 
+@router.patch("/{job_id}/close")
+async def close_job(job_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Close a job listing — no more applications accepted."""
+    from sqlalchemy import text
+    result = await db.execute(text(
+        "UPDATE jobs SET status = 'closed', updated_at = NOW() WHERE id = :job_id AND poster_id = :user_id RETURNING id"
+    ), {"job_id": job_id, "user_id": str(user.id)})
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found or not authorized")
+    return {"message": "Job closed"}
+
+
+@router.post("/{job_id}/invite/{developer_id}", status_code=status.HTTP_201_CREATED)
+async def invite_developer(
+    job_id: str,
+    developer_id: str,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Invite a developer to apply for a job — sends real-time notification."""
+    from sqlalchemy import text, select
+    from app.models import User as UserModel
+
+    # Verify job belongs to requester
+    job_result = await db.execute(text(
+        "SELECT title, poster_id FROM jobs WHERE id = :job_id AND status = 'open'"
+    ), {"job_id": job_id})
+    job_row = job_result.fetchone()
+    if not job_row:
+        raise HTTPException(status_code=404, detail="Job not found or not open")
+    if str(job_row[1]) != str(user.id):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # Verify developer exists
+    from sqlalchemy import select as sa_select
+    dev_result = await db.execute(sa_select(UserModel).where(UserModel.id == __import__("uuid").UUID(developer_id)))
+    developer = dev_result.scalar_one_or_none()
+    if not developer:
+        raise HTTPException(status_code=404, detail="Developer not found")
+
+    # Create invitation notification
+    notification = Notification(
+        user_id=developer.id,
+        actor_id=user.id,
+        type=NotificationType.JOB_INVITATION,
+        title=f"You've been invited to apply: {job_row[0]}",
+        body=f"Invited by {user.full_name}",
+        data={"job_id": job_id, "inviter_id": str(user.id)},
+        action_url=f"/jobs/{job_id}",
+    )
+    db.add(notification)
+    await db.flush()
+
+    # Real-time delivery
+    await ws_manager.send_to_user(developer_id, {
+        "type": "notification",
+        "data": {
+            "id": str(notification.id),
+            "type": "job_invitation",
+            "title": notification.title,
+            "body": notification.body,
+            "action_url": notification.action_url,
+            "data": notification.data,
+        },
+    })
+
+    return {"message": f"Invitation sent to {developer.full_name}"}
+
+
 @router.patch("/applications/{application_id}")
 async def update_application_status(application_id: str, data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
     """Update application status (shortlist, reject, accept)."""
@@ -320,7 +432,6 @@ async def update_application_status(application_id: str, data: dict, user: User 
     if not row:
         raise HTTPException(status_code=404, detail="Application not found")
 
-    # Verify the user is the job poster
     if str(row["poster_id"]) != str(user.id):
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -328,19 +439,122 @@ async def update_application_status(application_id: str, data: dict, user: User 
     if new_status not in ["pending", "reviewed", "shortlisted", "accepted", "rejected"]:
         raise HTTPException(status_code=400, detail="Invalid status")
 
-    # Update status
     await db.execute(text(
         "UPDATE job_applications SET status = :status, updated_at = NOW() WHERE id = :app_id"
     ), {"status": new_status, "app_id": application_id})
 
-    # Notify the applicant
-    db.add(Notification(
+    # Determine notification type
+    if new_status == "accepted":
+        ntype = NotificationType.APPLICATION_ACCEPTED
+        notif_title = f"Congratulations! Your application for '{row['job_title']}' was accepted"
+    elif new_status == "rejected":
+        ntype = NotificationType.APPLICATION_REJECTED
+        notif_title = f"Application update for '{row['job_title']}': not selected"
+    else:
+        ntype = NotificationType.SYSTEM
+        notif_title = f"Application update: {row['job_title']} — {new_status}"
+
+    notification = Notification(
         user_id=row["applicant_id"],
         actor_id=user.id,
-        type=NotificationType.SYSTEM,
-        title=f"Application update: {row['job_title']}",
-        body=f"Your application has been {new_status}",
-        action_url="/jobs",
-    ))
+        type=ntype,
+        title=notif_title,
+        body=f"Status: {new_status}",
+        data={"job_id": str(row["job_id"]), "application_id": application_id, "status": new_status},
+        action_url="/jobs/my-applications",
+    )
+    db.add(notification)
+    await db.flush()
+
+    # Real-time push to applicant
+    await ws_manager.send_to_user(str(row["applicant_id"]), {
+        "type": "notification",
+        "data": {
+            "id": str(notification.id),
+            "type": ntype.value,
+            "title": notif_title,
+            "action_url": "/jobs/my-applications",
+            "data": {"job_id": str(row["job_id"]), "status": new_status},
+        },
+    })
 
     return {"message": f"Application {new_status}"}
+
+
+@router.post("/{job_id}/applications/{application_id}/open-chat", status_code=status.HTTP_201_CREATED)
+async def open_hiring_chat(
+    job_id: str,
+    application_id: str,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Open a dedicated hiring conversation with the applicant from the application review."""
+    from sqlalchemy import text, select as sa_select
+    from app.models import Conversation, ConversationParticipant, User as UserModel
+    from uuid import UUID
+
+    # Verify job belongs to user
+    job_result = await db.execute(text(
+        "SELECT title, poster_id FROM jobs WHERE id = :job_id"
+    ), {"job_id": job_id})
+    job_row = job_result.fetchone()
+    if not job_row or str(job_row[1]) != str(user.id):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # Get applicant ID
+    app_result = await db.execute(text(
+        "SELECT applicant_id FROM job_applications WHERE id = :app_id"
+    ), {"app_id": application_id})
+    app_row = app_result.fetchone()
+    if not app_row:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    applicant_id = app_row[0]
+
+    # Check if a hiring conversation for this job already exists between these two users
+    existing = await db.execute(sa_select(Conversation).where(
+        Conversation.job_id == UUID(job_id),
+        Conversation.type == "hiring",
+    ))
+    existing_conv = existing.scalar_one_or_none()
+
+    if existing_conv:
+        return {"conversation_id": str(existing_conv.id), "existing": True}
+
+    # Create dedicated hiring conversation
+    conv = Conversation(
+        type="hiring",
+        name=f"Job: {job_row[0]}",
+        job_id=UUID(job_id),
+    )
+    db.add(conv)
+    await db.flush()
+
+    db.add(ConversationParticipant(conversation_id=conv.id, user_id=user.id))
+    db.add(ConversationParticipant(conversation_id=conv.id, user_id=UUID(str(applicant_id))))
+
+    # Notify applicant
+    notification = Notification(
+        user_id=UUID(str(applicant_id)),
+        actor_id=user.id,
+        type=NotificationType.MESSAGE,
+        title=f"{user.full_name} wants to chat about: {job_row[0]}",
+        body="A hiring conversation has been started",
+        data={"conversation_id": str(conv.id), "job_id": job_id},
+        action_url="/messaging",
+    )
+    db.add(notification)
+    await db.flush()
+
+    await ws_manager.send_to_user(str(applicant_id), {
+        "type": "notification",
+        "data": {
+            "id": str(notification.id),
+            "type": "message",
+            "title": notification.title,
+            "action_url": "/messaging",
+            "data": {"conversation_id": str(conv.id)},
+        },
+    })
+
+    return {"conversation_id": str(conv.id), "existing": False}

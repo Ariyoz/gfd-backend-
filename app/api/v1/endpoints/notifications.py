@@ -62,6 +62,7 @@ async def clear_all_notifications(user: User = Depends(get_current_active_user),
     """Delete all notifications for the current user."""
     from sqlalchemy import delete
     await db.execute(delete(Notification).where(Notification.user_id == user.id))
+    await db.commit()
 
 
 @router.delete("/{notification_id}", status_code=204)
@@ -71,3 +72,4 @@ async def delete_notification(notification_id: str, user: User = Depends(get_cur
     await db.execute(
         delete(Notification).where(Notification.id == UUID(notification_id), Notification.user_id == user.id)
     )
+    await db.commit()

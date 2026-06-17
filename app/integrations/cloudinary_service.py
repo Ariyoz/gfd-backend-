@@ -1,4 +1,4 @@
-"""Cloudinary file upload integration."""
+"""Cloudinary file upload integration — upgraded for Phase 2."""
 
 import cloudinary
 import cloudinary.uploader
@@ -15,19 +15,30 @@ cloudinary.config(
 )
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-ALLOWED_FILE_TYPES = {*ALLOWED_IMAGE_TYPES, "application/pdf"}
-MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_VIDEO_TYPES = {"video/mp4", "video/webm", "video/quicktime", "video/mpeg"}
+ALLOWED_ATTACHMENT_TYPES = {
+    *ALLOWED_IMAGE_TYPES,
+    "application/pdf",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/x-rar-compressed",
+    "application/x-7z-compressed",
+    "application/octet-stream",
+}
+
+MAX_IMAGE_SIZE = 10 * 1024 * 1024   # 10 MB
+MAX_FILE_SIZE  = 20 * 1024 * 1024   # 20 MB (message attachments & documents)
+MAX_VIDEO_SIZE = 100 * 1024 * 1024  # 100 MB
 
 
 async def upload_image(file: UploadFile, folder: str = "gfd", transformation: dict = None) -> dict:
-    """Upload an image to Cloudinary with optimization."""
+    """Upload an image to Cloudinary with auto-optimization."""
     if file.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(status_code=400, detail=f"Invalid image type. Allowed: {ALLOWED_IMAGE_TYPES}")
+        raise HTTPException(status_code=400, detail="Invalid image type. Allowed: jpeg, png, gif, webp")
 
     content = await file.read()
     if len(content) > MAX_IMAGE_SIZE:
-        raise HTTPException(status_code=400, detail="Image too large. Max 5MB.")
+        raise HTTPException(status_code=400, detail="Image too large. Max 10 MB.")
 
     options = {
         "folder": folder,
@@ -50,18 +61,22 @@ async def upload_image(file: UploadFile, folder: str = "gfd", transformation: di
 
 
 async def upload_file(file: UploadFile, folder: str = "gfd/files") -> dict:
-    """Upload a file (PDF, resume, etc.) to Cloudinary."""
-    if file.content_type not in ALLOWED_FILE_TYPES:
-        raise HTTPException(status_code=400, detail=f"Invalid file type. Allowed: {ALLOWED_FILE_TYPES}")
+    """Upload a file (PDF, archive, etc.) to Cloudinary. Max 20 MB."""
+    if file.content_type not in ALLOWED_ATTACHMENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Allowed: images, PDF, ZIP, RAR, 7Z"
+        )
 
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
+        raise HTTPException(status_code=400, detail="File too large. Max 20 MB.")
 
+    is_image = file.content_type in ALLOWED_IMAGE_TYPES
     result = cloudinary.uploader.upload(
         content,
         folder=folder,
-        resource_type="raw" if file.content_type == "application/pdf" else "image",
+        resource_type="image" if is_image else "raw",
     )
     return {
         "url": result["secure_url"],
@@ -69,11 +84,12 @@ async def upload_file(file: UploadFile, folder: str = "gfd/files") -> dict:
         "format": result.get("format"),
         "size": result.get("bytes"),
         "original_filename": file.filename,
+        "is_image": is_image,
     }
 
 
 async def upload_avatar(file: UploadFile, user_id: str) -> str:
-    """Upload and optimize avatar image."""
+    """Upload and optimize avatar image (400x400 face crop)."""
     result = await upload_image(
         file,
         folder="gfd/avatars",
@@ -83,7 +99,7 @@ async def upload_avatar(file: UploadFile, user_id: str) -> str:
 
 
 async def upload_banner(file: UploadFile, user_id: str) -> str:
-    """Upload and optimize banner image."""
+    """Upload and optimize banner image (1500x500)."""
     result = await upload_image(
         file,
         folder="gfd/banners",
@@ -93,13 +109,24 @@ async def upload_banner(file: UploadFile, user_id: str) -> str:
 
 
 async def upload_post_media(file: UploadFile) -> dict:
-    """Upload post media (image/video)."""
-    if file.content_type and file.content_type.startswith("video/"):
+    """Upload post media — image (10 MB) or video (100 MB)."""
+    content_type = file.content_type or ""
+
+    if content_type.startswith("video/") or content_type in ALLOWED_VIDEO_TYPES:
         content = await file.read()
-        if len(content) > 50 * 1024 * 1024:  # 50MB for video
-            raise HTTPException(status_code=400, detail="Video too large. Max 50MB.")
-        result = cloudinary.uploader.upload(content, folder="gfd/posts", resource_type="video")
-        return {"url": result["secure_url"], "type": "video", "public_id": result["public_id"]}
+        if len(content) > MAX_VIDEO_SIZE:
+            raise HTTPException(status_code=400, detail="Video too large. Max 100 MB.")
+        result = cloudinary.uploader.upload(
+            content,
+            folder="gfd/posts",
+            resource_type="video",
+        )
+        return {
+            "url": result["secure_url"],
+            "type": "video",
+            "public_id": result["public_id"],
+            "size": result.get("bytes"),
+        }
 
     result = await upload_image(file, folder="gfd/posts")
     return {**result, "type": "image"}

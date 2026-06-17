@@ -17,6 +17,7 @@ class NotificationType(str, enum.Enum):
     APPLICATION_RECEIVED = "application_received"
     APPLICATION_ACCEPTED = "application_accepted"
     APPLICATION_REJECTED = "application_rejected"
+    JOB_INVITATION = "job_invitation"
     PROJECT_UPDATE = "project_update"
     SYSTEM = "system"
     ADMIN_ALERT = "admin_alert"

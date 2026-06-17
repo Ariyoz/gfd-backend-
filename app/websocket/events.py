@@ -1,4 +1,4 @@
-"""WebSocket event types and broadcasting system."""
+"""WebSocket event types and broadcasting system — Phase 2 upgrade."""
 
 from enum import Enum
 from typing import Optional
@@ -24,6 +24,10 @@ class EventType(str, Enum):
     # Message events
     MESSAGE_SENT = "message_sent"
     MESSAGE_READ = "message_read"
+    MESSAGE_DELIVERED = "message_delivered"
+    MESSAGE_SEEN = "messages_seen"
+    MESSAGE_REACTION = "message_reaction"
+    MESSAGE_STATUS = "message_status_update"
     TYPING_START = "typing_start"
     TYPING_STOP = "typing_stop"
 
@@ -34,6 +38,11 @@ class EventType(str, Enum):
     PROFILE_UPDATED = "profile_updated"
     USER_ONLINE = "user_online"
     USER_OFFLINE = "user_offline"
+
+    # Hiring events
+    JOB_INVITATION = "job_invitation"
+    APPLICATION_RECEIVED = "application_received"
+    APPLICATION_STATUS = "application_status_update"
 
     # Admin events
     ADMIN_UPDATE = "admin_update"
@@ -51,7 +60,12 @@ async def broadcast_to_followers(db, user_id: UUID, event: dict):
         await ws_manager.send_to_user(fid, event)
 
 
-async def broadcast_event(event_type: EventType, data: dict, targets: list[str] = None, exclude: str = None):
+async def broadcast_event(
+    event_type: EventType,
+    data: dict,
+    targets: list[str] = None,
+    exclude: str = None,
+):
     """Broadcast an event to specific users or all connected users."""
     event = {"type": event_type.value, "data": data}
 
@@ -64,8 +78,10 @@ async def broadcast_event(event_type: EventType, data: dict, targets: list[str] 
 
 
 async def notify_admins(event_type: EventType, data: dict):
-    """Send event to all connected admin users."""
-    # Admin connections are tracked separately
-    event = {"type": EventType.ADMIN_UPDATE.value, "sub_type": event_type.value, "data": data}
-    # Broadcast to all — admins filter on frontend
+    """Send ADMIN_UPDATE event to all connected users (admins filter client-side)."""
+    event = {
+        "type": EventType.ADMIN_UPDATE.value,
+        "sub_type": event_type.value,
+        "data": data,
+    }
     await ws_manager.broadcast(event)

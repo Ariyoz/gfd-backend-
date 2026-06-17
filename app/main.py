@@ -118,7 +118,54 @@ async def lifespan(app: FastAPI):
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """))
-        print("✅ Database columns verified")
+
+            # ── Phase 2 upgrades: add new columns if they don't exist ──
+            await conn.execute(text("""
+                DO $$
+                BEGIN
+                    -- messages: reactions, link_preview, status, file_type
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='reactions') THEN
+                        ALTER TABLE messages ADD COLUMN reactions JSONB DEFAULT '{}';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='link_preview') THEN
+                        ALTER TABLE messages ADD COLUMN link_preview JSONB;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='status') THEN
+                        ALTER TABLE messages ADD COLUMN status VARCHAR(20) DEFAULT 'sent';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='file_type') THEN
+                        ALTER TABLE messages ADD COLUMN file_type VARCHAR(50);
+                    END IF;
+                    -- conversations: job_id for hiring chats
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='job_id') THEN
+                        ALTER TABLE conversations ADD COLUMN job_id UUID;
+                    END IF;
+                    -- conversation_participants: unread_count
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversation_participants' AND column_name='unread_count') THEN
+                        ALTER TABLE conversation_participants ADD COLUMN unread_count INTEGER DEFAULT 0;
+                    END IF;
+                    -- posts: video_url, document_url, document_name, link_preview
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='posts' AND column_name='video_url') THEN
+                        ALTER TABLE posts ADD COLUMN video_url TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='posts' AND column_name='document_url') THEN
+                        ALTER TABLE posts ADD COLUMN document_url TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='posts' AND column_name='document_name') THEN
+                        ALTER TABLE posts ADD COLUMN document_name VARCHAR(255);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='posts' AND column_name='link_preview') THEN
+                        ALTER TABLE posts ADD COLUMN link_preview JSONB;
+                    END IF;
+                    -- notifications: job_invitation type support (enum might need updating)
+                    -- jobs: close support (status already exists as VARCHAR)
+                    -- job_applications: expected_salary_currency
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='job_applications' AND column_name='expected_salary_currency') THEN
+                        ALTER TABLE job_applications ADD COLUMN expected_salary_currency VARCHAR(10) DEFAULT 'USD';
+                    END IF;
+                END $$;
+            """))
+        print("✅ Database columns verified (Phase 2 migrations applied)")
     except Exception as e:
         print(f"⚠️ Migration check: {e}")
 

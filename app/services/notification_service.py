@@ -121,3 +121,55 @@ class NotificationService:
             action_url=f"/messaging",
             data={"conversation_id": str(conversation_id)},
         )
+
+    @staticmethod
+    async def notify_mention(db: AsyncSession, mentioned_id: UUID, actor_id: UUID, actor_name: str, post_id: UUID):
+        await NotificationService.create(
+            db=db,
+            user_id=mentioned_id,
+            actor_id=actor_id,
+            type=NotificationType.MENTION,
+            title=f"{actor_name} mentioned you in a post",
+            data={"post_id": str(post_id)},
+            action_url=f"/feed/{post_id}",
+        )
+
+    @staticmethod
+    async def notify_job_invitation(
+        db: AsyncSession,
+        developer_id: UUID,
+        inviter_id: UUID,
+        inviter_name: str,
+        job_id: str,
+        job_title: str,
+    ):
+        await NotificationService.create(
+            db=db,
+            user_id=developer_id,
+            actor_id=inviter_id,
+            type=NotificationType.JOB_INVITATION,
+            title=f"You've been invited to apply: {job_title}",
+            body=f"Invited by {inviter_name}",
+            data={"job_id": job_id, "inviter_id": str(inviter_id)},
+            action_url=f"/jobs/{job_id}",
+        )
+
+    @staticmethod
+    async def notify_application_received(
+        db: AsyncSession,
+        poster_id: UUID,
+        applicant_id: UUID,
+        applicant_name: str,
+        job_title: str,
+        job_id: str,
+        application_id: str,
+    ):
+        await NotificationService.create(
+            db=db,
+            user_id=poster_id,
+            actor_id=applicant_id,
+            type=NotificationType.APPLICATION_RECEIVED,
+            title=f"{applicant_name} applied to: {job_title}",
+            data={"job_id": job_id, "application_id": application_id},
+            action_url=f"/jobs/{job_id}/applications",
+        )
