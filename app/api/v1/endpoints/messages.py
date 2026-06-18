@@ -7,7 +7,7 @@ from uuid import UUID
 from typing import Optional
 
 from app.database import get_db
-from app.models import Conversation, ConversationParticipant, Message, User, Notification, NotificationType
+from app.models import Conversation, ConversationParticipant, Message, User, Notification, NotificationType, ConversationType
 from app.core.dependencies import get_current_active_user
 from app.websocket import ws_manager
 
@@ -17,11 +17,12 @@ router = APIRouter()
 
 def _serialize_message(msg: Message, current_user_id: str) -> dict:
     reply_preview = None
-    if msg.reply_to:
+    reply_to = getattr(msg, "reply_to", None)
+    if reply_to:
         reply_preview = {
-            "id": str(msg.reply_to.id),
-            "sender_id": str(msg.reply_to.sender_id),
-            "content": (msg.reply_to.content or "")[:200],
+            "id": str(reply_to.id),
+            "sender_id": str(reply_to.sender_id),
+            "content": (reply_to.content or "")[:200],
         }
     return {
         "id": str(msg.id),
@@ -148,7 +149,7 @@ async def create_conversation(
                 return {"id": str(existing_id), "message": "Conversation already exists", "existing": True}
 
     conv = Conversation(
-        type=conv_type,
+        type=ConversationType(conv_type),
         name=data.get("name"),
         job_id=UUID(data["job_id"]) if data.get("job_id") else None,
     )

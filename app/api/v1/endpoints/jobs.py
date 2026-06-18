@@ -33,6 +33,9 @@ async def list_jobs(
     if job_type:
         where_clauses.append("j.job_type = :job_type")
         params["job_type"] = job_type
+    if experience_level:
+        where_clauses.append("j.experience_level = :experience_level")
+        params["experience_level"] = experience_level
     if is_remote is not None:
         where_clauses.append("j.is_remote = :is_remote")
         params["is_remote"] = is_remote
@@ -282,10 +285,11 @@ async def apply_to_job(job_id: str, data: dict, user: User = Depends(get_current
         db.add(Notification(
             user_id=job_row[0],
             actor_id=user.id,
-            type=NotificationType.SYSTEM,
+            type=NotificationType.APPLICATION_RECEIVED,
             title=f"New application from {user.full_name}",
             body=f"Applied to: {job_row[1]}",
-            action_url=f"/dashboard/jobs",
+            data={"job_id": job_id, "applicant_id": str(user.id)},
+            action_url=f"/jobs/{job_id}/applications",
         ))
 
     await db.flush()
@@ -512,9 +516,10 @@ async def open_hiring_chat(
     applicant_id = app_row[0]
 
     # Check if a hiring conversation for this job already exists between these two users
+    from app.models import ConversationType
     existing = await db.execute(sa_select(Conversation).where(
         Conversation.job_id == UUID(job_id),
-        Conversation.type == "hiring",
+        Conversation.type == ConversationType.HIRING,
     ))
     existing_conv = existing.scalar_one_or_none()
 
@@ -523,7 +528,7 @@ async def open_hiring_chat(
 
     # Create dedicated hiring conversation
     conv = Conversation(
-        type="hiring",
+        type=ConversationType.HIRING,
         name=f"Job: {job_row[0]}",
         job_id=UUID(job_id),
     )

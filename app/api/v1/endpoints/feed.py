@@ -1,4 +1,4 @@
-﻿"""Feed & social endpoints â€” upgraded with link previews, hashtags, mentions, trending, rich media."""
+"""Feed & social endpoints -- upgraded with link previews, hashtags, mentions, trending, rich media."""
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,7 +8,7 @@ from typing import Optional
 from datetime import datetime, timedelta, timezone
 
 from app.database import get_db
-from app.models import Post, Comment, Like, Bookmark, User, PostType, PostVisibility, Follow, Hashtag
+from app.models import Post, Comment, Like, Bookmark, User, PostType, PostVisibility, Follow, Hashtag, NotificationType
 from app.core.dependencies import get_current_active_user
 from app.services.realtime import RealtimeService
 from app.services.notification_service import NotificationService
@@ -103,7 +103,7 @@ async def get_feed(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Get feed â€” following, explore, or user-specific."""
+    """Get feed Ã¢â‚¬â€ following, explore, or user-specific."""
     offset = (page - 1) * limit
 
     if feed_type == "following" and user:
@@ -244,7 +244,7 @@ async def create_post(
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new post â€” extracts hashtags/mentions, generates link preview, broadcasts."""
+    """Create a new post Ã¢â‚¬â€ extracts hashtags/mentions, generates link preview, broadcasts."""
     from app.services.link_preview import fetch_link_preview, extract_urls, extract_hashtags, extract_mentions
 
     content = data.get("content", "")
@@ -308,7 +308,7 @@ async def create_post(
                 db=db,
                 user_id=mentioned.id,
                 actor_id=user.id,
-                type=__import__("app.models", fromlist=["NotificationType"]).NotificationType.MENTION,
+                type=NotificationType.MENTION,
                 title=f"{user.full_name} mentioned you in a post",
                 data={"post_id": str(post.id)},
                 action_url=f"/feed/{post.id}",
@@ -372,6 +372,28 @@ async def delete_post(
     await RealtimeService.on_post_deleted(db, UUID(post_id), user.id)
 
 
+@router.get("/bookmarks/me")
+async def get_my_bookmarks(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get current user's bookmarked posts."""
+    offset = (page - 1) * limit
+    result = await db.execute(
+        select(Post)
+        .join(Bookmark, Bookmark.post_id == Post.id)
+        .where(Bookmark.user_id == user.id)
+        .order_by(desc(Bookmark.created_at))
+        .offset(offset)
+        .limit(limit)
+    )
+    posts = result.scalars().all()
+    enriched = await _enrich_posts(posts, user, db)
+    return {"posts": enriched}
+
+
 @router.get("/{post_id}")
 async def get_post(
     post_id: str,
@@ -416,7 +438,7 @@ async def like_post(
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Like a post â€” instant count update + notification."""
+    """Like a post Ã¢â‚¬â€ instant count update + notification."""
     pid = UUID(post_id)
     existing = await db.execute(select(Like).where(Like.user_id == user.id, Like.post_id == pid))
     if existing.scalar_one_or_none():
@@ -457,7 +479,7 @@ async def add_comment(
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Add a comment â€” supports nested replies, triggers mention notifications."""
+    """Add a comment Ã¢â‚¬â€ supports nested replies, triggers mention notifications."""
     from app.services.link_preview import extract_mentions
 
     pid = UUID(post_id)
@@ -535,7 +557,7 @@ async def repost(
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Repost a post â€” toggle. Creates child Post with parent_post_id."""
+    """Repost a post Ã¢â‚¬â€ toggle. Creates child Post with parent_post_id."""
     pid = UUID(post_id)
 
     existing = await db.execute(select(Post).where(Post.author_id == user.id, Post.parent_post_id == pid))
@@ -635,25 +657,4 @@ async def get_post_comments(
 
     return {"comments": enriched}
 
-
-@router.get("/bookmarks/me")
-async def get_my_bookmarks(
-    page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=100),
-    user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get current user's bookmarked posts."""
-    offset = (page - 1) * limit
-    result = await db.execute(
-        select(Post)
-        .join(Bookmark, Bookmark.post_id == Post.id)
-        .where(Bookmark.user_id == user.id)
-        .order_by(desc(Bookmark.created_at))
-        .offset(offset)
-        .limit(limit)
-    )
-    posts = result.scalars().all()
-    enriched = await _enrich_posts(posts, user, db)
-    return {"posts": enriched}
 
