@@ -358,6 +358,8 @@ async def upload_message_attachment(
         "image/jpeg", "image/png", "image/gif", "image/webp",
         "application/pdf",
         "application/zip", "application/x-zip-compressed",
+        # Voice notes
+        "audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav",
     }
     MAX_SIZE = 20 * 1024 * 1024
 
@@ -371,10 +373,12 @@ async def upload_message_attachment(
     try:
         import cloudinary.uploader
         is_image = file.content_type.startswith("image/")
+        is_audio = file.content_type.startswith("audio/")
+        resource_type = "image" if is_image else "video" if is_audio else "raw"
         result = cloudinary.uploader.upload(
             content,
             folder=f"gfd/messages/{user.id}",
-            resource_type="image" if is_image else "raw",
+            resource_type=resource_type,
         )
         return {
             "url": result["secure_url"],
@@ -382,6 +386,7 @@ async def upload_message_attachment(
             "file_size": len(content),
             "file_type": file.content_type,
             "is_image": is_image,
+            "is_audio": is_audio,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
