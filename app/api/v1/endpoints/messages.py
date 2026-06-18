@@ -45,14 +45,14 @@ async def get_conversations(user: User = Depends(get_current_active_user), db: A
                 other_user_id = p.user_id
                 break
 
-        other_name = conv.name or "Conversation"
+        other_name = conv.name or "Unknown User"
         other_avatar = conv.avatar
         other_online = False
         if other_user_id:
             other_result = await db.execute(select(User).where(User.id == other_user_id))
             other_user = other_result.scalar_one_or_none()
             if other_user:
-                other_name = other_user.full_name
+                other_name = other_user.full_name  # Always use real name
                 other_avatar = other_user.avatar
                 other_online = other_user.is_online or False
             if ws_manager.is_online(str(other_user_id)):
