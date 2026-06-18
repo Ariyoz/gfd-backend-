@@ -20,7 +20,7 @@ router = APIRouter()
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-async def register(data: RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(data: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Register a new user with email/password."""
     # Check existing
     existing = await db.execute(select(User).where((User.email == data.email) | (User.username == data.username)))

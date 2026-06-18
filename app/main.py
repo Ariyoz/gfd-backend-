@@ -178,15 +178,26 @@ app = FastAPI(
     title="GFD API",
     description="Global Fullstack Developers — Backend API",
     version=settings.APP_VERSION,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    # Disable docs in production to prevent API enumeration
+    docs_url="/docs" if settings.APP_ENV != "production" else None,
+    redoc_url="/redoc" if settings.APP_ENV != "production" else None,
+    openapi_url="/openapi.json" if settings.APP_ENV != "production" else None,
     lifespan=lifespan,
 )
 
 # ── Middleware ──
-from app.middleware.security import SecurityHeadersMiddleware, RequestIDMiddleware, RequestLoggingMiddleware, InputSanitizationMiddleware
+from app.middleware.security import (
+    SecurityHeadersMiddleware,
+    RequestIDMiddleware,
+    RequestLoggingMiddleware,
+    InputSanitizationMiddleware,
+    AuthRateLimitMiddleware,
+    RequestSizeLimitMiddleware,
+)
 
 app.add_middleware(InputSanitizationMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware)
+app.add_middleware(AuthRateLimitMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
@@ -194,8 +205,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins + ["https://globalfd.xyz", "https://www.globalfd.xyz"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
+    max_age=600,
 )
 
 # Rate limiting
@@ -210,12 +223,21 @@ app.include_router(api_router)
 @app.websocket("/ws/{token}")
 async def websocket_endpoint(websocket: WebSocket, token: str):
     """WebSocket connection for real-time features."""
+    # Validate token length to prevent oversized token DoS
+    if not token or len(token) > 2048:
+        await websocket.close(code=4001)
+        return
+
     payload = decode_token(token)
-    if not payload:
+    if not payload or payload.get("type") != "access":
         await websocket.close(code=4001)
         return
 
     user_id = payload.get("sub")
+    if not user_id:
+        await websocket.close(code=4001)
+        return
+
     await ws_manager.connect(websocket, user_id)
 
     # Update DB online status
@@ -240,98 +262,123 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             "data": {"user_ids": online_users},
         })
 
+    WS_MAX_MESSAGE_SIZE = 64 * 1024  # 64 KB per WS message
+
     try:
         while True:
-            data = await websocket.receive_json()
+            raw = await websocket.receive_text()
+
+            # Enforce max WS message size to prevent DoS
+            if len(raw) > WS_MAX_MESSAGE_SIZE:
+                await websocket.send_json({"type": "error", "detail": "Message too large"})
+                continue
+
+            try:
+                data = __import__("json").loads(raw)
+            except Exception:
+                continue
+
             msg_type = data.get("type")
 
+            # Validate target user_id format to prevent injection
+            target = data.get("to", "")
+            if target and len(target) != 36:  # UUID length
+                continue
+
             if msg_type == "typing_start":
-                await ws_manager.send_to_user(data.get("to"), {
-                    "type": "typing_start",
-                    "from": user_id,
-                    "conversation_id": data.get("conversation_id"),
-                })
+                if target:
+                    await ws_manager.send_to_user(target, {
+                        "type": "typing_start",
+                        "from": user_id,
+                        "conversation_id": data.get("conversation_id"),
+                    })
 
             elif msg_type == "typing_stop":
-                await ws_manager.send_to_user(data.get("to"), {
-                    "type": "typing_stop",
-                    "from": user_id,
-                    "conversation_id": data.get("conversation_id"),
-                })
+                if target:
+                    await ws_manager.send_to_user(target, {
+                        "type": "typing_stop",
+                        "from": user_id,
+                        "conversation_id": data.get("conversation_id"),
+                    })
 
             elif msg_type == "message":
-                await ws_manager.send_to_user(data.get("to"), {
-                    "type": "message_sent",
-                    "from": user_id,
-                    "from_name": data.get("from_name", ""),
-                    "from_avatar": data.get("from_avatar", ""),
-                    "content": data.get("content"),
-                    "conversation_id": data.get("conversation_id"),
-                    "timestamp": data.get("timestamp"),
-                })
+                content = data.get("content", "")
+                if len(content) > 5000:  # Cap content at 5000 chars
+                    content = content[:5000]
+                if target:
+                    await ws_manager.send_to_user(target, {
+                        "type": "message_sent",
+                        "from": user_id,
+                        "from_name": data.get("from_name", "")[:100],
+                        "from_avatar": data.get("from_avatar", "")[:512],
+                        "content": content,
+                        "conversation_id": data.get("conversation_id"),
+                        "timestamp": data.get("timestamp"),
+                    })
 
             elif msg_type == "message_read":
-                await ws_manager.send_to_user(data.get("to"), {
-                    "type": "message_read",
-                    "from": user_id,
-                    "conversation_id": data.get("conversation_id"),
-                    "message_id": data.get("message_id"),
-                })
+                if target:
+                    await ws_manager.send_to_user(target, {
+                        "type": "message_read",
+                        "from": user_id,
+                        "conversation_id": data.get("conversation_id"),
+                        "message_id": data.get("message_id"),
+                    })
 
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
 
             # ── Call Signaling ──
             elif msg_type == "call_initiate":
-                target = data.get("to")
-                print(f"[CALL] {user_id} calling {target} | Online: {ws_manager.is_online(target) if target else False}")
                 if target:
                     await ws_manager.send_to_user(target, {
                         "type": "incoming_call",
                         "from": user_id,
                         "call_type": data.get("call_type", "voice"),
-                        "caller_name": data.get("caller_name", ""),
-                        "caller_avatar": data.get("caller_avatar", ""),
+                        "caller_name": data.get("caller_name", "")[:100],
+                        "caller_avatar": data.get("caller_avatar", "")[:512],
                         "offer": data.get("offer"),
                     })
 
             elif msg_type == "call_accept":
-                await ws_manager.send_to_user(data.get("to"), {
-                    "type": "call_accepted",
-                    "from": user_id,
-                    "answer": data.get("answer"),
-                })
+                if target:
+                    await ws_manager.send_to_user(target, {
+                        "type": "call_accepted",
+                        "from": user_id,
+                        "answer": data.get("answer"),
+                    })
 
             elif msg_type == "call_reject":
-                await ws_manager.send_to_user(data.get("to"), {
-                    "type": "call_rejected",
-                    "from": user_id,
-                })
+                if target:
+                    await ws_manager.send_to_user(target, {
+                        "type": "call_rejected",
+                        "from": user_id,
+                    })
 
             elif msg_type == "call_end":
-                await ws_manager.send_to_user(data.get("to"), {
-                    "type": "call_ended",
-                    "from": user_id,
-                })
+                if target:
+                    await ws_manager.send_to_user(target, {
+                        "type": "call_ended",
+                        "from": user_id,
+                    })
 
             elif msg_type == "webrtc_ice":
-                await ws_manager.send_to_user(data.get("to"), {
-                    "type": "webrtc_ice",
-                    "from": user_id,
-                    "candidate": data.get("candidate"),
-                })
+                if target:
+                    await ws_manager.send_to_user(target, {
+                        "type": "webrtc_ice",
+                        "from": user_id,
+                        "candidate": data.get("candidate"),
+                    })
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket, user_id)
-        # Update DB offline status
         try:
             from app.database.session import AsyncSessionLocal
             from sqlalchemy import text
             async with AsyncSessionLocal() as session:
                 await session.execute(text("UPDATE users SET is_online = FALSE WHERE id = CAST(:uid AS UUID)"), {"uid": user_id})
                 await session.commit()
-        except Exception as e:
-            print(f"[WARN] Failed to set offline: {e}")
+        except Exception:
             pass
         await broadcast_event(EventType.USER_OFFLINE, {"user_id": user_id})
 

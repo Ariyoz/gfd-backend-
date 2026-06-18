@@ -13,6 +13,10 @@ from app.websocket import ws_manager
 
 router = APIRouter()
 
+# ── Constants ────────────────────────────────────────────────────────────────
+MAX_MESSAGE_LENGTH = 5000
+MAX_FILE_NAME_LENGTH = 255
+
 # ── helpers ────────────────────────────────────────────────────────────────
 
 def _serialize_message(msg: Message, current_user_id: str) -> dict:
@@ -265,9 +269,12 @@ async def send_message(
         raise HTTPException(status_code=403, detail="Not a participant")
 
     content = data.get("content", "")
+    # Validate and truncate content
+    if len(content) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Message too long. Max {MAX_MESSAGE_LENGTH} characters.")
     msg_type = data.get("message_type", data.get("type", "text"))
     media_url = data.get("media_url")
-    file_name = data.get("file_name")
+    file_name = str(data.get("file_name", "") or "")[:MAX_FILE_NAME_LENGTH]
     file_size = data.get("file_size")
     file_type = data.get("file_type")
     reply_to_id = data.get("reply_to_id")
