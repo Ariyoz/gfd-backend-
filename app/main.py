@@ -118,6 +118,16 @@ async def lifespan(app: FastAPI):
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """))
+            # ── Phase 2: add reactions column to messages (safe) ──
+            await conn.execute(text("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='messages' AND column_name='reactions') THEN
+                        ALTER TABLE messages ADD COLUMN reactions JSONB DEFAULT '{}';
+                    END IF;
+                END $$;
+            """))
         print("✅ Database columns verified")
     except Exception as e:
         print(f"⚠️ Migration check: {e}")
