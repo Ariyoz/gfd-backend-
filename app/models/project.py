@@ -56,6 +56,7 @@ class Project(BaseModel):
     view_count = Column(Integer, default=0)
     like_count = Column(Integer, default=0)
     cover_image = Column(Text, nullable=True)
+    repository_url = Column(Text, nullable=True)  # Link to project/repo
 
     # Relationships
     client = relationship("ClientProfile", back_populates="projects")

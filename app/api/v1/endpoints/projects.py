@@ -90,6 +90,8 @@ async def list_projects(
             "author_name": author_name,
             "author_username": author_username,
             "author_avatar": author_avatar,
+            # Project link
+            "repository_url": getattr(p, "repository_url", None),
         })
 
     return {

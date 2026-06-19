@@ -126,6 +126,10 @@ async def lifespan(app: FastAPI):
                         WHERE table_name='messages' AND column_name='reactions') THEN
                         ALTER TABLE messages ADD COLUMN reactions JSONB DEFAULT '{}';
                     END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='projects' AND column_name='repository_url') THEN
+                        ALTER TABLE projects ADD COLUMN repository_url TEXT;
+                    END IF;
                 END $$;
             """))
         print("✅ Database columns verified")
