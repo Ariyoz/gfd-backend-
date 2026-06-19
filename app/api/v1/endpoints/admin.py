@@ -55,6 +55,15 @@ async def get_analytics(user: User = Depends(require_admin), db: AsyncSession = 
         "total_messages": messages_count,
         "pending_subscriptions": pending_subs,
         "active_subscriptions": active_subs,
+        # camelCase aliases for frontend compatibility
+        "totalUsers": users_count,
+        "totalPosts": posts_count,
+        "totalProjects": projects_count,
+        "pendingReports": reports_count,
+        "suspendedUsers": suspended_count,
+        "verifiedUsers": verified_count,
+        "pendingSubscriptions": pending_subs,
+        "activeSubscriptions": active_subs,
     }
 
 
@@ -82,11 +91,39 @@ async def list_users(
 
 
 @router.patch("/users/{user_id}/suspend")
-async def suspend_user(user_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
-    """Suspend a user."""
+async def suspend_user(user_id: str, data: dict = {}, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Suspend a user for a specified duration (hours). 0 = indefinite."""
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy import text
+
+    duration_hours = data.get("duration_hours", 0)  # 0 = indefinite
+    reason = data.get("reason", "")
+
     await db.execute(update(User).where(User.id == UUID(user_id)).values(status=UserStatus.SUSPENDED))
-    db.add(AuditLog(admin_id=admin.id, action="suspend_user", target_type="user", target_id=UUID(user_id)))
-    return {"message": "User suspended"}
+
+    # Store suspension metadata in audit log
+    db.add(AuditLog(
+        admin_id=admin.id,
+        action="suspend_user",
+        target_type="user",
+        target_id=UUID(user_id),
+        reason=reason or None,
+        after_state={
+            "duration_hours": duration_hours,
+            "suspended_until": (
+                (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat()
+                if duration_hours > 0 else "indefinite"
+            ),
+        }
+    ))
+    return {
+        "message": "User suspended",
+        "duration_hours": duration_hours,
+        "suspended_until": (
+            (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat()
+            if duration_hours > 0 else "indefinite"
+        )
+    }
 
 
 @router.patch("/users/{user_id}/reinstate")

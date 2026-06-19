@@ -42,8 +42,30 @@ async def list_projects(
     count_result = await db.execute(select(func.count()).select_from(Project))
     total = count_result.scalar() or 0
 
-    return {
-        "projects": [{
+    # Fetch author info for each project
+    from app.models import User, ClientProfile
+    project_data = []
+    for p in projects:
+        # Get author via client_profile -> user
+        author_name = "Unknown"
+        author_username = ""
+        author_avatar = None
+        author_id = None
+        try:
+            cp_result = await db.execute(select(ClientProfile).where(ClientProfile.id == p.client_id))
+            cp = cp_result.scalar_one_or_none()
+            if cp:
+                u_result = await db.execute(select(User).where(User.id == cp.user_id))
+                u = u_result.scalar_one_or_none()
+                if u:
+                    author_name = u.full_name
+                    author_username = u.username
+                    author_avatar = u.avatar
+                    author_id = str(u.id)
+        except Exception:
+            pass
+
+        project_data.append({
             "id": str(p.id),
             "title": p.title,
             "description": p.description,
@@ -63,7 +85,15 @@ async def list_projects(
             "like_count": p.like_count or 0,
             "cover_image": p.cover_image,
             "created_at": str(p.created_at),
-        } for p in projects],
+            # Author info
+            "author_id": author_id,
+            "author_name": author_name,
+            "author_username": author_username,
+            "author_avatar": author_avatar,
+        })
+
+    return {
+        "projects": project_data,
         "total": total,
         "page": page,
     }
