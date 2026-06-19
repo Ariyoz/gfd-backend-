@@ -170,6 +170,13 @@ async def create_project(data: dict, user: User = Depends(get_current_active_use
         experience_level=data.get("experience_level"),
         cover_image=data.get("cover_image"),
     )
+    # Set repository_url safely (column added in Phase 2 migration)
+    try:
+        repo = data.get("repository_url") or data.get("github_url") or data.get("live_url")
+        if repo:
+            project.repository_url = repo
+    except Exception:
+        pass
     db.add(project)
     await db.flush()
     return {"id": str(project.id), "message": "Project created"}
