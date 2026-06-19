@@ -92,24 +92,47 @@ async def list_users(
 
 @router.patch("/users/{user_id}/suspend")
 async def suspend_user(user_id: str, data: dict = {}, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
-    """Suspend a user for a specified duration (hours). 0 = indefinite."""
+    """Suspend a user. duration_hours=0 means indefinite — wipes all their content."""
     from datetime import datetime, timezone, timedelta
-    from sqlalchemy import text
 
-    duration_hours = data.get("duration_hours", 0)  # 0 = indefinite
+    duration_hours = data.get("duration_hours", 0)
     reason = data.get("reason", "")
+    is_indefinite = (duration_hours == 0)
 
     await db.execute(update(User).where(User.id == UUID(user_id)).values(status=UserStatus.SUSPENDED))
 
-    # Store suspension metadata in audit log
+    # If indefinite, delete ALL user content
+    if is_indefinite:
+        from app.models import Post, Comment, Like, Bookmark, Project, Application, ClientProfile, Notification
+        from app.models import ConversationParticipant
+
+        # Delete posts (cascade deletes comments, likes, bookmarks via FK)
+        await db.execute(
+            __import__("sqlalchemy").delete(Post).where(Post.author_id == UUID(user_id))
+        )
+        # Delete their projects (cascade deletes applications)
+        cp_result = await db.execute(
+            select(ClientProfile).where(ClientProfile.user_id == UUID(user_id))
+        )
+        cp = cp_result.scalar_one_or_none()
+        if cp:
+            await db.execute(
+                __import__("sqlalchemy").delete(Project).where(Project.client_id == cp.id)
+            )
+        # Delete notifications
+        await db.execute(
+            __import__("sqlalchemy").delete(Notification).where(Notification.user_id == UUID(user_id))
+        )
+
     db.add(AuditLog(
         admin_id=admin.id,
-        action="suspend_user",
+        action="suspend_user_indefinite" if is_indefinite else "suspend_user",
         target_type="user",
         target_id=UUID(user_id),
         reason=reason or None,
         after_state={
             "duration_hours": duration_hours,
+            "content_deleted": is_indefinite,
             "suspended_until": (
                 (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat()
                 if duration_hours > 0 else "indefinite"
@@ -117,13 +140,72 @@ async def suspend_user(user_id: str, data: dict = {}, admin: User = Depends(requ
         }
     ))
     return {
-        "message": "User suspended",
+        "message": "User suspended" + (" and all content deleted" if is_indefinite else ""),
         "duration_hours": duration_hours,
-        "suspended_until": (
-            (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat()
-            if duration_hours > 0 else "indefinite"
-        )
+        "content_deleted": is_indefinite,
     }
+
+
+# ── Admin: delete any user permanently ────────────────────────────────────────
+
+@router.delete("/users/{user_id}/delete")
+async def admin_delete_user(user_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Permanently delete a user and ALL their content (posts, projects, messages, etc.)."""
+    result = await db.execute(select(User).where(User.id == UUID(user_id)))
+    user_to_delete = result.scalar_one_or_none()
+    if not user_to_delete:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    db.add(AuditLog(
+        admin_id=admin.id,
+        action="delete_user",
+        target_type="user",
+        target_id=UUID(user_id),
+        before_state={"email": user_to_delete.email, "name": user_to_delete.full_name},
+    ))
+    await db.delete(user_to_delete)  # CASCADE handles all related records
+    return {"message": "User permanently deleted"}
+
+
+# ── Admin: delete any post ────────────────────────────────────────────────────
+
+@router.delete("/content/post/{post_id}")
+async def admin_delete_post(post_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Admin: delete any user's post and all its comments/reactions."""
+    from app.models import Post
+    result = await db.execute(select(Post).where(Post.id == UUID(post_id)))
+    post = result.scalar_one_or_none()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    db.add(AuditLog(admin_id=admin.id, action="delete_post", target_type="post", target_id=UUID(post_id)))
+    await db.delete(post)
+    return {"message": "Post deleted"}
+
+
+# ── Admin: delete any project ─────────────────────────────────────────────────
+
+@router.delete("/content/project/{project_id}")
+async def admin_delete_project(project_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Admin: delete any user's project and all its applications."""
+    from app.models import Project
+    result = await db.execute(select(Project).where(Project.id == UUID(project_id)))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    db.add(AuditLog(admin_id=admin.id, action="delete_project", target_type="project", target_id=UUID(project_id)))
+    await db.delete(project)
+    return {"message": "Project deleted"}
+
+
+# ── Admin: delete any job ─────────────────────────────────────────────────────
+
+@router.delete("/content/job/{job_id}")
+async def admin_delete_job(job_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Admin: delete any user's job posting."""
+    from sqlalchemy import text as sql_text
+    await db.execute(sql_text("DELETE FROM jobs WHERE id = :jid"), {"jid": job_id})
+    db.add(AuditLog(admin_id=admin.id, action="delete_job", target_type="job"))
+    return {"message": "Job deleted"}
 
 
 @router.patch("/users/{user_id}/reinstate")
