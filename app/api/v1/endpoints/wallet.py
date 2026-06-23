@@ -390,7 +390,9 @@ async def initialize_payment(
         "amount":       int(amount_naira * 100),  # Paystack uses kobo
         "reference":    reference,
         "callback_url": callback,
-        "channels":     ["card", "bank", "ussd", "bank_transfer"],
+        # Start with card only — bank_transfer requires verified Paystack account
+        # Once your Paystack account is verified, add: "bank", "ussd", "bank_transfer"
+        "channels":     ["card"],
         "metadata": {
             "wallet_id": wallet["id"],
             "user_id":   str(user.id),
