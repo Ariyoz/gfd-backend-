@@ -138,8 +138,19 @@ async def lifespan(app: FastAPI):
                     status VARCHAR(20) DEFAULT 'pending',
                     created_at TIMESTAMP DEFAULT NOW()
                 );
+                CREATE TABLE IF NOT EXISTS virtual_accounts (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                    bank_name VARCHAR(100),
+                    account_name VARCHAR(200),
+                    account_number VARCHAR(20),
+                    provider VARCHAR(50),
+                    customer_code VARCHAR(100),
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
                 CREATE INDEX IF NOT EXISTS idx_wt_wallet ON wallet_transactions(wallet_id);
                 CREATE INDEX IF NOT EXISTS idx_wt_reference ON wallet_transactions(reference);
+                CREATE INDEX IF NOT EXISTS idx_va_user ON virtual_accounts(user_id);
             """))            # ── Phase 2: add reactions column to messages (safe) ──
             await conn.execute(text("""
                 DO $$

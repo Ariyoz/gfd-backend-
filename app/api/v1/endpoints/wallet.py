@@ -1,12 +1,13 @@
 """
 Wallet endpoints — full Paystack integration.
 
-Flow:
-  Fund:     POST /wallet/initialize  → Paystack page → redirect back → POST /wallet/verify
-  Withdraw: POST /wallet/withdraw    → creates Paystack transfer recipient → initiates transfer
-  Webhook:  POST /wallet/webhook     → Paystack calls this automatically for charge.success / transfer.success
-  Admin:    GET  /wallet/admin/pending-withdrawals
-            POST /wallet/admin/approve-withdrawal/{ref}
+Funding flows:
+  1. Dedicated Virtual Account (DVA) — user gets a personal bank account number.
+     Any transfer to it auto-credits their wallet via webhook. (Recommended)
+  2. Checkout redirect — POST /wallet/initialize → Paystack page → POST /wallet/verify
+
+Withdraw: POST /wallet/withdraw → Paystack Transfer API (instant)
+Webhook:  POST /wallet/webhook  → handles charge.success / transfer.success / dedicatedaccount.assign.success
 """
 
 import hmac
@@ -104,12 +105,154 @@ async def ping_paystack():
     except Exception as e:
         return {"configured": False, "message": str(e)}
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  DEDICATED VIRTUAL ACCOUNT (DVA)
+#  Each user gets a permanent personal bank account number.
+#  Any transfer to it credits their wallet automatically via webhook.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/virtual-account")
+async def get_virtual_account(
+    user: User = Depends(get_current_active_user),
+    db:   AsyncSession = Depends(get_db),
+):
+    """Return the user's dedicated virtual account, or None if not yet created."""
+    r = await db.execute(
+        text("""
+            SELECT bank_name, account_name, account_number, provider, created_at
+            FROM virtual_accounts
+            WHERE user_id = CAST(:uid AS UUID)
+        """),
+        {"uid": str(user.id)},
+    )
+    row = r.fetchone()
+    if not row:
+        return {"virtual_account": None}
+    return {
+        "virtual_account": {
+            "bank_name":      row[0],
+            "account_name":   row[1],
+            "account_number": row[2],
+            "provider":       row[3],
+            "created_at":     str(row[4]),
+        }
+    }
+
+
+@router.post("/virtual-account/create")
+async def create_virtual_account(
+    user: User = Depends(get_current_active_user),
+    db:   AsyncSession = Depends(get_db),
+):
+    """
+    Create a Paystack Dedicated Virtual Account for this user.
+    Steps:
+      1. Create a Paystack Customer (or reuse existing)
+      2. Assign a DVA to that customer
+    """
+    if not settings.PAYSTACK_SECRET_KEY:
+        raise HTTPException(503, "Payment gateway not configured")
+
+    # Check if already has one
+    r = await db.execute(
+        text("SELECT account_number FROM virtual_accounts WHERE user_id = CAST(:uid AS UUID)"),
+        {"uid": str(user.id)},
+    )
+    existing = r.fetchone()
+    if existing:
+        raise HTTPException(400, "Virtual account already exists for this user")
+
+    # ── Step 1: Create or fetch Paystack Customer ──
+    async with httpx.AsyncClient(timeout=20) as client:
+        # Check if customer already exists
+        cust_resp = await client.get(
+            f"{PS_BASE}/customer/{user.email}",
+            headers=_ps_headers(),
+        )
+
+    customer_code = None
+    if cust_resp.status_code == 200 and cust_resp.json().get("status"):
+        customer_code = cust_resp.json()["data"]["customer_code"]
+    else:
+        # Create new customer
+        name_parts = (user.full_name or user.email.split("@")[0]).split(" ", 1)
+        first = name_parts[0]
+        last  = name_parts[1] if len(name_parts) > 1 else first
+
+        async with httpx.AsyncClient(timeout=20) as client:
+            cr = await client.post(
+                f"{PS_BASE}/customer",
+                json={"email": user.email, "first_name": first, "last_name": last},
+                headers=_ps_headers(),
+            )
+        if cr.status_code not in (200, 201) or not cr.json().get("status"):
+            raise HTTPException(502, f"Could not create Paystack customer: {cr.text[:300]}")
+        customer_code = cr.json()["data"]["customer_code"]
+
+    # ── Step 2: Assign DVA ──
+    # preferred_bank options: "wema-bank", "titan-paystack", "sterling-bank"
+    async with httpx.AsyncClient(timeout=30) as client:
+        dva_resp = await client.post(
+            f"{PS_BASE}/dedicated_account",
+            json={
+                "customer":       customer_code,
+                "preferred_bank": "wema-bank",   # most widely supported
+            },
+            headers=_ps_headers(),
+        )
+
+    if dva_resp.status_code not in (200, 201):
+        try:
+            err = dva_resp.json().get("message", dva_resp.text[:300])
+        except Exception:
+            err = dva_resp.text[:300]
+        raise HTTPException(502, f"Could not create virtual account: {err}")
+
+    dva = dva_resp.json()
+    if not dva.get("status"):
+        raise HTTPException(502, dva.get("message", "DVA creation failed"))
+
+    acct = dva["data"]
+    bank_name      = acct.get("bank", {}).get("name", "Wema Bank")
+    account_number = acct.get("account_number", "")
+    account_name   = acct.get("account_name", user.full_name or "")
+    provider       = acct.get("bank", {}).get("slug", "wema-bank")
+
+    # Persist to DB
+    await db.execute(
+        text("""
+            INSERT INTO virtual_accounts
+                (id, user_id, bank_name, account_name, account_number, provider,
+                 customer_code, created_at)
+            VALUES
+                (gen_random_uuid(), CAST(:uid AS UUID), :bn, :an, :anum, :prov, :cc, NOW())
+        """),
+        {
+            "uid":  str(user.id),
+            "bn":   bank_name,
+            "an":   account_name,
+            "anum": account_number,
+            "prov": provider,
+            "cc":   customer_code,
+        },
+    )
+
+    return {
+        "virtual_account": {
+            "bank_name":      bank_name,
+            "account_name":   account_name,
+            "account_number": account_number,
+            "provider":       provider,
+        },
+        "message": f"Your dedicated {bank_name} account has been created!",
+    }
+
+
 @router.get("")
 async def get_wallet(
     user: User = Depends(get_current_active_user),
     db:   AsyncSession = Depends(get_db),
-):
-    wallet = await _get_or_create_wallet(str(user.id), db)
+):    wallet = await _get_or_create_wallet(str(user.id), db)
 
     # Monthly earnings (deposits + incoming earnings this calendar month)
     r = await db.execute(
@@ -550,14 +693,31 @@ async def paystack_webhook(request: Request, db: AsyncSession = Depends(get_db))
     ev_type = event.get("event", "")
     ev_data = event.get("data", {})
 
-    # ── charge.success  (card/bank payment completed) ──
+    # ── charge.success  (card/bank payment OR virtual account transfer) ──
     if ev_type == "charge.success":
         reference    = ev_data.get("reference", "")
         amount_naira = ev_data.get("amount", 0) / 100
-        meta         = ev_data.get("metadata", {})
+        channel      = ev_data.get("channel", "")
+        meta         = ev_data.get("metadata", {}) or {}
         wallet_id    = meta.get("wallet_id")
 
-        if wallet_id and reference:
+        # For DVA transfers: look up wallet by customer email
+        if not wallet_id and channel in ("dedicated_nuban", "bank_transfer"):
+            customer_email = ev_data.get("customer", {}).get("email", "")
+            if customer_email:
+                r2 = await db.execute(
+                    text("""
+                        SELECT w.id FROM wallets w
+                        JOIN users u ON u.id = w.user_id
+                        WHERE u.email = :email
+                    """),
+                    {"email": customer_email},
+                )
+                row2 = r2.fetchone()
+                if row2:
+                    wallet_id = str(row2[0])
+
+        if wallet_id and reference and amount_naira > 0:
             r = await db.execute(
                 text("SELECT status FROM wallet_transactions WHERE reference = :ref"),
                 {"ref": reference},
@@ -573,14 +733,24 @@ async def paystack_webhook(request: Request, db: AsyncSession = Depends(get_db))
                     """),
                     {"amt": amount_naira, "wid": wallet_id},
                 )
-                await db.execute(
-                    text("""
-                        UPDATE wallet_transactions
-                        SET status = 'success'
-                        WHERE reference = :ref
-                    """),
-                    {"ref": reference},
-                )
+                # Upsert transaction record
+                if tx:
+                    await db.execute(
+                        text("UPDATE wallet_transactions SET status='success' WHERE reference=:ref"),
+                        {"ref": reference},
+                    )
+                else:
+                    desc = "Bank transfer (virtual account)" if channel in ("dedicated_nuban", "bank_transfer") else "Card payment"
+                    await db.execute(
+                        text("""
+                            INSERT INTO wallet_transactions
+                                (id, wallet_id, type, amount, description, reference, status, created_at)
+                            VALUES
+                                (gen_random_uuid(), CAST(:wid AS UUID), 'deposit', :amt,
+                                 :desc, :ref, 'success', NOW())
+                        """),
+                        {"wid": wallet_id, "amt": amount_naira, "desc": desc, "ref": reference},
+                    )
 
     # ── transfer.success  (withdrawal completed) ──
     elif ev_type == "transfer.success":
