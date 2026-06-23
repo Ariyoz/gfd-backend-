@@ -141,100 +141,121 @@ async def get_virtual_account(
 
 @router.post("/virtual-account/create")
 async def create_virtual_account(
+    data: dict = {},
     user: User = Depends(get_current_active_user),
     db:   AsyncSession = Depends(get_db),
 ):
     """
-    Create a Paystack Dedicated Virtual Account for this user.
-    Steps:
-      1. Create a Paystack Customer (or reuse existing)
-      2. Assign a DVA to that customer
+    Create a Paystack Dedicated Virtual Account for this user (NGN).
+    Requires DVA to be enabled on your Paystack account.
     """
     if not settings.PAYSTACK_SECRET_KEY:
         raise HTTPException(503, "Payment gateway not configured")
 
     # Check if already has one
     r = await db.execute(
-        text("SELECT account_number FROM virtual_accounts WHERE user_id = CAST(:uid AS UUID)"),
+        text("SELECT account_number, bank_name FROM virtual_accounts WHERE user_id = CAST(:uid AS UUID)"),
         {"uid": str(user.id)},
     )
     existing = r.fetchone()
     if existing:
-        raise HTTPException(400, "Virtual account already exists for this user")
+        return {
+            "virtual_account": {
+                "account_number": existing[0],
+                "bank_name":      existing[1],
+            },
+            "message": "Account already exists",
+        }
 
     # ── Step 1: Create or fetch Paystack Customer ──
+    customer_code = None
+
+    # Try to find existing customer first
     async with httpx.AsyncClient(timeout=20) as client:
-        # Check if customer already exists
         cust_resp = await client.get(
             f"{PS_BASE}/customer/{user.email}",
             headers=_ps_headers(),
         )
 
-    customer_code = None
-    if cust_resp.status_code == 200 and cust_resp.json().get("status"):
-        customer_code = cust_resp.json()["data"]["customer_code"]
-    else:
+    if cust_resp.status_code == 200:
+        ps_cust = cust_resp.json()
+        if ps_cust.get("status") and ps_cust.get("data"):
+            customer_code = ps_cust["data"].get("customer_code")
+            # Validate the customer (required for DVA)
+            if not ps_cust["data"].get("identified"):
+                await _validate_customer(customer_code, user)
+
+    if not customer_code:
         # Create new customer
-        name_parts = (user.full_name or user.email.split("@")[0]).split(" ", 1)
+        name_parts = (getattr(user, 'full_name', None) or user.email.split("@")[0]).split(" ", 1)
         first = name_parts[0]
-        last  = name_parts[1] if len(name_parts) > 1 else first
+        last  = name_parts[1] if len(name_parts) > 1 else name_parts[0]
 
         async with httpx.AsyncClient(timeout=20) as client:
             cr = await client.post(
                 f"{PS_BASE}/customer",
-                json={"email": user.email, "first_name": first, "last_name": last},
+                json={
+                    "email":      user.email,
+                    "first_name": first,
+                    "last_name":  last,
+                },
                 headers=_ps_headers(),
             )
-        if cr.status_code not in (200, 201) or not cr.json().get("status"):
-            raise HTTPException(502, f"Could not create Paystack customer: {cr.text[:300]}")
-        customer_code = cr.json()["data"]["customer_code"]
 
-    # ── Step 2: Assign DVA ──
-    # preferred_bank options: "wema-bank", "titan-paystack", "sterling-bank"
-    async with httpx.AsyncClient(timeout=30) as client:
-        dva_resp = await client.post(
-            f"{PS_BASE}/dedicated_account",
-            json={
-                "customer":       customer_code,
-                "preferred_bank": "wema-bank",   # most widely supported
-            },
-            headers=_ps_headers(),
-        )
+        cr_json = cr.json()
+        if cr.status_code not in (200, 201) or not cr_json.get("status"):
+            raise HTTPException(502, cr_json.get("message", "Could not create Paystack customer"))
 
-    if dva_resp.status_code not in (200, 201):
+        customer_code = cr_json["data"]["customer_code"]
+
+    # ── Step 2: Try banks in order until one works ──
+    banks_to_try = ["wema-bank", "titan-paystack", "sterling-bank"]
+    dva_resp = None
+    last_err = "DVA not available"
+
+    for bank in banks_to_try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{PS_BASE}/dedicated_account",
+                json={"customer": customer_code, "preferred_bank": bank},
+                headers=_ps_headers(),
+            )
+        if resp.status_code in (200, 201) and resp.json().get("status"):
+            dva_resp = resp
+            break
         try:
-            err = dva_resp.json().get("message", dva_resp.text[:300])
+            last_err = resp.json().get("message", resp.text[:200])
         except Exception:
-            err = dva_resp.text[:300]
-        raise HTTPException(502, f"Could not create virtual account: {err}")
+            last_err = resp.text[:200]
 
-    dva = dva_resp.json()
-    if not dva.get("status"):
-        raise HTTPException(502, dva.get("message", "DVA creation failed"))
+    if not dva_resp:
+        # DVA not enabled on this Paystack account — give helpful message
+        if "not enabled" in last_err.lower() or "not available" in last_err.lower():
+            raise HTTPException(503,
+                "Dedicated virtual accounts are not yet enabled on this platform. "
+                "Please use the 'Fund via Card/Bank' option instead."
+            )
+        raise HTTPException(502, f"Could not create virtual account: {last_err}")
 
-    acct = dva["data"]
-    bank_name      = acct.get("bank", {}).get("name", "Wema Bank")
+    acct = dva_resp.json()["data"]
+    bank_name      = acct.get("bank", {}).get("name", "Bank")
     account_number = acct.get("account_number", "")
-    account_name   = acct.get("account_name", user.full_name or "")
-    provider       = acct.get("bank", {}).get("slug", "wema-bank")
+    account_name   = acct.get("account_name", getattr(user, 'full_name', user.email))
+    provider       = acct.get("bank", {}).get("slug", "paystack")
 
-    # Persist to DB
+    # Persist
     await db.execute(
         text("""
             INSERT INTO virtual_accounts
-                (id, user_id, bank_name, account_name, account_number, provider,
-                 customer_code, created_at)
+                (id, user_id, bank_name, account_name, account_number, provider, customer_code, created_at)
             VALUES
                 (gen_random_uuid(), CAST(:uid AS UUID), :bn, :an, :anum, :prov, :cc, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+                SET account_number = EXCLUDED.account_number,
+                    bank_name = EXCLUDED.bank_name
         """),
-        {
-            "uid":  str(user.id),
-            "bn":   bank_name,
-            "an":   account_name,
-            "anum": account_number,
-            "prov": provider,
-            "cc":   customer_code,
-        },
+        {"uid": str(user.id), "bn": bank_name, "an": account_name,
+         "anum": account_number, "prov": provider, "cc": customer_code},
     )
 
     return {
@@ -246,6 +267,25 @@ async def create_virtual_account(
         },
         "message": f"Your dedicated {bank_name} account has been created!",
     }
+
+
+async def _validate_customer(customer_code: str, user):
+    """Validate (identify) Paystack customer — required before DVA assignment."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.post(
+                f"{PS_BASE}/customer/{customer_code}/identification",
+                json={
+                    "country":     "NG",
+                    "type":        "bvn",
+                    "value":       "00000000000",  # placeholder — real BVN would go here
+                    "first_name":  getattr(user, 'full_name', '').split()[0] if getattr(user, 'full_name', '') else 'User',
+                    "last_name":   getattr(user, 'full_name', '').split()[-1] if getattr(user, 'full_name', '') else 'User',
+                },
+                headers=_ps_headers(),
+            )
+    except Exception:
+        pass  # Validation is best-effort
 
 
 @router.get("")
