@@ -118,7 +118,29 @@ async def lifespan(app: FastAPI):
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """))
-            # ── Phase 2: add reactions column to messages (safe) ──
+            # ── Wallet tables ──
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS wallets (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                    balance NUMERIC(12,2) DEFAULT 0,
+                    total_earned NUMERIC(12,2) DEFAULT 0,
+                    total_withdrawn NUMERIC(12,2) DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS wallet_transactions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+                    type VARCHAR(20) NOT NULL,
+                    amount NUMERIC(12,2) NOT NULL,
+                    description TEXT,
+                    reference VARCHAR(100),
+                    status VARCHAR(20) DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_wt_wallet ON wallet_transactions(wallet_id);
+                CREATE INDEX IF NOT EXISTS idx_wt_reference ON wallet_transactions(reference);
+            """))            # ── Phase 2: add reactions column to messages (safe) ──
             await conn.execute(text("""
                 DO $$
                 BEGIN
