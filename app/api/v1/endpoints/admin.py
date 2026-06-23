@@ -1,4 +1,4 @@
-"""Admin endpoints — moderation, user management, analytics."""
+﻿"""Admin endpoints â€” moderation, user management, analytics."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -92,7 +92,7 @@ async def list_users(
 
 @router.patch("/users/{user_id}/suspend")
 async def suspend_user(user_id: str, data: dict = {}, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
-    """Suspend a user. duration_hours=0 means indefinite — wipes all their content."""
+    """Suspend a user. duration_hours=0 means indefinite â€” wipes all their content."""
     from datetime import datetime, timezone, timedelta
 
     duration_hours = data.get("duration_hours", 0)
@@ -103,27 +103,16 @@ async def suspend_user(user_id: str, data: dict = {}, admin: User = Depends(requ
 
     # If indefinite, delete ALL user content
     if is_indefinite:
-        from app.models import Post, Comment, Like, Bookmark, Project, Application, ClientProfile, Notification
-        from app.models import ConversationParticipant
-
-        # Delete posts (cascade deletes comments, likes, bookmarks via FK)
-        await db.execute(
-            __import__("sqlalchemy").delete(Post).where(Post.author_id == UUID(user_id))
-        )
-        # Delete their projects (cascade deletes applications)
+        from app.models import Post, Project, ClientProfile, Notification
+        from sqlalchemy import delete as sa_delete
+        await db.execute(sa_delete(Post).where(Post.author_id == UUID(user_id)))
         cp_result = await db.execute(
             select(ClientProfile).where(ClientProfile.user_id == UUID(user_id))
         )
         cp = cp_result.scalar_one_or_none()
         if cp:
-            await db.execute(
-                __import__("sqlalchemy").delete(Project).where(Project.client_id == cp.id)
-            )
-        # Delete notifications
-        await db.execute(
-            __import__("sqlalchemy").delete(Notification).where(Notification.user_id == UUID(user_id))
-        )
-
+            await db.execute(sa_delete(Project).where(Project.client_id == cp.id))
+        await db.execute(sa_delete(Notification).where(Notification.user_id == UUID(user_id)))
     db.add(AuditLog(
         admin_id=admin.id,
         action="suspend_user_indefinite" if is_indefinite else "suspend_user",
@@ -146,7 +135,7 @@ async def suspend_user(user_id: str, data: dict = {}, admin: User = Depends(requ
     }
 
 
-# ── Admin: delete any user permanently ────────────────────────────────────────
+# â”€â”€ Admin: delete any user permanently â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @router.delete("/users/{user_id}/delete")
 async def admin_delete_user(user_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
@@ -167,7 +156,7 @@ async def admin_delete_user(user_id: str, admin: User = Depends(require_admin), 
     return {"message": "User permanently deleted"}
 
 
-# ── Admin: delete any post ────────────────────────────────────────────────────
+# â”€â”€ Admin: delete any post â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @router.delete("/content/post/{post_id}")
 async def admin_delete_post(post_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
@@ -182,7 +171,7 @@ async def admin_delete_post(post_id: str, admin: User = Depends(require_admin), 
     return {"message": "Post deleted"}
 
 
-# ── Admin: delete any project ─────────────────────────────────────────────────
+# â”€â”€ Admin: delete any project â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @router.delete("/content/project/{project_id}")
 async def admin_delete_project(project_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
@@ -197,7 +186,7 @@ async def admin_delete_project(project_id: str, admin: User = Depends(require_ad
     return {"message": "Project deleted"}
 
 
-# ── Admin: delete any job ─────────────────────────────────────────────────────
+# â”€â”€ Admin: delete any job â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @router.delete("/content/job/{job_id}")
 async def admin_delete_job(job_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
@@ -264,7 +253,7 @@ async def delete_user(user_id: str, admin: User = Depends(require_admin), db: As
     return {"message": "User deleted"}
 
 
-# ── Subscription Management ──
+# â”€â”€ Subscription Management â”€â”€
 
 @router.get("/subscriptions")
 async def get_all_subscriptions(
