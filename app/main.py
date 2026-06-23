@@ -312,3 +312,5 @@ async def health_check():
 @app.get("/")
 async def root():
     return {"message": "GFD API", "version": settings.APP_VERSION, "docs": "/docs"}
+
+# Deploy trigger: 2026-06-23 11:18
