@@ -252,7 +252,8 @@ async def create_virtual_account(
 async def get_wallet(
     user: User = Depends(get_current_active_user),
     db:   AsyncSession = Depends(get_db),
-):    wallet = await _get_or_create_wallet(str(user.id), db)
+):
+    wallet = await _get_or_create_wallet(str(user.id), db)
 
     # Monthly earnings (deposits + incoming earnings this calendar month)
     r = await db.execute(
