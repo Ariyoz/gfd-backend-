@@ -75,6 +75,10 @@ async def login(data: LoginRequest, db: AsyncSession = Depends(get_db)):
     if user.status == UserStatus.SUSPENDED:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account suspended")
 
+    # Auto-activate pending_verification users so they can log in
+    if user.status == UserStatus.PENDING_VERIFICATION:
+        user.status = UserStatus.ACTIVE
+
     access_token = create_access_token(user.id, user.role.value)
     refresh_token = create_refresh_token(user.id)
 

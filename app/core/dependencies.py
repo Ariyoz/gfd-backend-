@@ -43,8 +43,10 @@ async def get_current_user(
 
 
 async def get_current_active_user(user: User = Depends(get_current_user)) -> User:
-    """Ensure user is active."""
-    if user.status.value != "active":
+    """Ensure user is active. Admins bypass status check."""
+    if user.role.value == "admin":
+        return user  # Admins always allowed regardless of status
+    if user.status.value not in ("active", "pending_verification"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account not active")
     return user
 
