@@ -174,9 +174,10 @@ async def initialize_payment(
 
     wallet    = await _get_or_create_wallet(str(user.id), db)
     reference = f"gfd-{uuid4().hex[:20]}"
+    frontend_url = getattr(settings, 'FRONTEND_URL', 'https://www.globalfd.xyz')
     callback  = data.get(
         "callback_url",
-        "https://www.globalfd.xyz/wallet?verify=1",
+        f"{frontend_url}/wallet",
     )
 
     payload = {

@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     PAYSTACK_SECRET_KEY: str = ""
     PAYSTACK_PUBLIC_KEY: str = ""
 
+    # ── Frontend ──
+    FRONTEND_URL: str = "https://www.globalfd.xyz"
+
     # ── Celery ──
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
