@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     RESEND_API_KEY: str = ""
     RESEND_FROM_EMAIL: str = "noreply@gfd.dev"
 
+    # ── Paystack ──
+    PAYSTACK_SECRET_KEY: str = ""
+    PAYSTACK_PUBLIC_KEY: str = ""
+
     # ── Celery ──
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
