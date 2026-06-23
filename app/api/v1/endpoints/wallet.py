@@ -87,6 +87,23 @@ def _verify_paystack_signature(body: bytes, signature: str) -> bool:
 #  GET /wallet  —  balance + stats
 # ══════════════════════════════════════════════════════════════════════════════
 
+@router.get("/ping")
+async def ping_paystack():
+    """Check if Paystack key is configured and reachable (no auth needed)."""
+    if not settings.PAYSTACK_SECRET_KEY:
+        return {"configured": False, "message": "PAYSTACK_SECRET_KEY not set"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{PS_BASE}/bank?country=nigeria&perPage=1",
+                headers=_ps_headers(),
+            )
+        if resp.status_code == 200:
+            return {"configured": True, "message": "Paystack connected ✓", "key_prefix": settings.PAYSTACK_SECRET_KEY[:12] + "..."}
+        return {"configured": False, "message": f"Paystack returned {resp.status_code}: {resp.text[:200]}"}
+    except Exception as e:
+        return {"configured": False, "message": str(e)}
+
 @router.get("")
 async def get_wallet(
     user: User = Depends(get_current_active_user),
@@ -163,6 +180,10 @@ async def initialize_payment(
     Returns { authorization_url, access_code, reference }.
     Frontend redirects user to authorization_url.
     """
+    # Guard: key must be configured
+    if not settings.PAYSTACK_SECRET_KEY:
+        raise HTTPException(503, "Payment gateway not configured. Contact support.")
+
     amount_kobo = data.get("amount", 0)
     try:
         amount_naira = float(amount_kobo)
@@ -190,28 +211,38 @@ async def initialize_payment(
             "wallet_id": wallet["id"],
             "user_id":   str(user.id),
             "custom_fields": [
-                {"display_name": "Platform", "variable_name": "platform", "value": "GFD"},
-                {"display_name": "User",     "variable_name": "user_email", "value": user.email},
+                {"display_name": "Platform",    "variable_name": "platform",    "value": "GFD"},
+                {"display_name": "User Email",  "variable_name": "user_email",  "value": user.email},
             ],
         },
     }
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(
-            f"{PS_BASE}/transaction/initialize",
-            json=payload,
-            headers=_ps_headers(),
-        )
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                f"{PS_BASE}/transaction/initialize",
+                json=payload,
+                headers=_ps_headers(),
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Payment gateway timed out. Please try again.")
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach payment gateway: {str(e)}")
 
+    # Return Paystack's actual error message to the frontend
     if resp.status_code != 200:
-        raise HTTPException(502, f"Paystack error: {resp.text}")
+        try:
+            err_body = resp.json()
+            err_msg  = err_body.get("message", resp.text)
+        except Exception:
+            err_msg = resp.text
+        raise HTTPException(502, f"Paystack: {err_msg}")
 
     ps = resp.json()
     if not ps.get("status"):
         raise HTTPException(502, ps.get("message", "Paystack rejected the request"))
 
     ps_data = ps["data"]
-
     # Record a pending transaction so we can track it
     await db.execute(
         text("""
