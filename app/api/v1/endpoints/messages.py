@@ -40,10 +40,12 @@ async def get_conversations(user: User = Depends(get_current_active_user), db: A
         parts = parts_result.scalars().all()
 
         other_user_id = None
+        my_unread = 0
         for p in parts:
             if p.user_id != user.id:
                 other_user_id = p.user_id
-                break
+            else:
+                my_unread = p.unread_count or 0
 
         other_name = conv.name or "Unknown User"
         other_avatar = conv.avatar
@@ -65,9 +67,10 @@ async def get_conversations(user: User = Depends(get_current_active_user), db: A
             "avatar": other_avatar,
             "online": other_online,
             "last_message_content": conv.last_message_content,
-            "last_message_at": conv.last_message_at,
+            "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
             "is_active": conv.is_active,
             "other_user_id": str(other_user_id) if other_user_id else None,
+            "unread_count": my_unread,
         })
 
     return {"conversations": enriched}
@@ -209,7 +212,7 @@ async def send_message(
         .where(Conversation.id == UUID(conv_id))
         .values(
             last_message_content=(content or "📎 Attachment")[:100],
-            last_message_at=str(msg.created_at) if msg.created_at else None,
+            last_message_at=msg.created_at,
         )
     )
 
@@ -253,6 +256,16 @@ async def send_message(
             "reactions": {},
             "timestamp": str(msg.created_at) if msg.created_at else None,
         })
+
+        # Increment unread count for recipient
+        await db.execute(
+            update(ConversationParticipant)
+            .where(
+                ConversationParticipant.conversation_id == UUID(conv_id),
+                ConversationParticipant.user_id == participant.user_id,
+            )
+            .values(unread_count=ConversationParticipant.unread_count + 1)
+        )
 
         db.add(Notification(
             user_id=participant.user_id,
@@ -346,6 +359,34 @@ async def react_to_message(
         })
 
     return {"reactions": reactions, "action": action}
+
+
+@router.post("/conversations/{conv_id}/read")
+async def mark_conversation_read(
+    conv_id: str,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reset unread count when user opens a conversation."""
+    await db.execute(
+        update(ConversationParticipant)
+        .where(
+            ConversationParticipant.conversation_id == UUID(conv_id),
+            ConversationParticipant.user_id == user.id,
+        )
+        .values(unread_count=0)
+    )
+    # Mark all messages in conversation as read
+    await db.execute(
+        update(Message)
+        .where(
+            Message.conversation_id == UUID(conv_id),
+            Message.sender_id != user.id,
+            Message.is_read == False,
+        )
+        .values(is_read=True, status="seen")
+    )
+    return {"ok": True}
 
 
 @router.post("/upload-attachment")
