@@ -463,8 +463,99 @@ async def flw_webhook(request: Request, db: AsyncSession = Depends(get_db)):
 
 
 # ══════════════════════════════════════════════════════════
-# GET /wallet/banks — Nigerian bank list
+# VIRTUAL ACCOUNT — each user gets a permanent account number
 # ══════════════════════════════════════════════════════════
+
+@router.get("/virtual-account")
+async def get_virtual_account(
+    user: User = Depends(get_current_active_user),
+    db:   AsyncSession = Depends(get_db),
+):
+    r = await db.execute(
+        text("""SELECT bank_name, account_name, account_number, provider, created_at
+                FROM virtual_accounts WHERE user_id = CAST(:uid AS UUID)"""),
+        {"uid": str(user.id)},
+    )
+    row = r.fetchone()
+    if not row:
+        return {"virtual_account": None}
+    return {"virtual_account": {
+        "bank_name": row[0], "account_name": row[1],
+        "account_number": row[2], "provider": row[3], "created_at": str(row[4]),
+    }}
+
+
+@router.post("/virtual-account/create")
+async def create_virtual_account(
+    user: User = Depends(get_current_active_user),
+    db:   AsyncSession = Depends(get_db),
+):
+    """Create a Flutterwave Dedicated Virtual Account for this user."""
+    if not settings.FLW_SECRET_KEY:
+        raise HTTPException(503, "Payment gateway not configured")
+
+    # Return existing if already has one
+    r = await db.execute(
+        text("SELECT bank_name, account_name, account_number FROM virtual_accounts WHERE user_id = CAST(:uid AS UUID)"),
+        {"uid": str(user.id)},
+    )
+    existing = r.fetchone()
+    if existing:
+        return {"virtual_account": {"bank_name": existing[0], "account_name": existing[1], "account_number": existing[2]},
+                "message": "Account already exists"}
+
+    full_name  = getattr(user, "full_name", None) or user.email.split("@")[0]
+    name_parts = full_name.split(" ", 1)
+    email      = user.email
+    bvn        = getattr(user, "bvn", None) or "00000000000"  # BVN required by FLW; collect from user later
+
+    # Create virtual account with Flutterwave
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{FLW_BASE}/virtual-account-numbers",
+                json={
+                    "email":      email,
+                    "is_permanent": True,
+                    "bvn":        bvn,
+                    "tx_ref":     f"dva-{user.id}",
+                    "firstname":  name_parts[0],
+                    "lastname":   name_parts[1] if len(name_parts) > 1 else name_parts[0],
+                    "narration":  f"GFD — {full_name}",
+                },
+                headers=_flw_headers(),
+            )
+    except Exception as e:
+        raise HTTPException(502, f"Could not create virtual account: {e}")
+
+    flw = resp.json()
+    if resp.status_code not in (200, 201) or flw.get("status") != "success":
+        msg = flw.get("message", resp.text[:300])
+        # If BVN not provided or account type not supported, give clear message
+        if "bvn" in msg.lower():
+            raise HTTPException(503, "BVN required to create a virtual account. Please add your BVN in Settings.")
+        raise HTTPException(502, f"Virtual account error: {msg}")
+
+    data           = flw["data"]
+    bank_name      = data.get("bank_name", "Flutterwave")
+    account_number = data.get("account_number", "")
+    account_name   = data.get("account_name", full_name)
+    order_ref      = data.get("order_ref", "")
+
+    # Save to DB
+    await db.execute(
+        text("""INSERT INTO virtual_accounts
+                    (id, user_id, bank_name, account_name, account_number, provider, customer_code, created_at)
+                VALUES (gen_random_uuid(), CAST(:uid AS UUID), :bn, :an, :anum, 'flutterwave', :cc, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                    SET account_number = EXCLUDED.account_number, bank_name = EXCLUDED.bank_name"""),
+        {"uid": str(user.id), "bn": bank_name, "an": account_name, "anum": account_number, "cc": order_ref},
+    )
+
+    return {
+        "virtual_account": {"bank_name": bank_name, "account_name": account_name, "account_number": account_number},
+        "message": f"Your dedicated {bank_name} account has been created!",
+    }
 
 @router.get("/banks")
 async def get_banks(user: User = Depends(get_current_active_user)):
