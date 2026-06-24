@@ -221,13 +221,16 @@ async def flw_initialize(
 
     if resp.status_code != 200:
         try:
-            msg = resp.json().get("message", resp.text[:300])
+            err_body = resp.json()
+            msg = err_body.get("message", err_body.get("error", resp.text[:400]))
         except Exception:
-            msg = resp.text[:300]
+            msg = resp.text[:400]
+        print(f"[FLW INIT ERROR] {resp.status_code}: {resp.text[:500]}")
         raise HTTPException(502, f"Flutterwave: {msg}")
 
     flw = resp.json()
     if flw.get("status") != "success":
+        print(f"[FLW INIT REJECTED] {flw}")
         raise HTTPException(502, flw.get("message", "Flutterwave rejected the request"))
 
     payment_link = flw["data"]["link"]
@@ -490,7 +493,7 @@ async def create_virtual_account(
     user: User = Depends(get_current_active_user),
     db:   AsyncSession = Depends(get_db),
 ):
-    """Create a Flutterwave Dedicated Virtual Account for this user."""
+    """Create a Flutterwave Virtual Account for this user (tries permanent first, falls back to non-permanent)."""
     if not settings.FLW_SECRET_KEY:
         raise HTTPException(503, "Payment gateway not configured")
 
@@ -506,56 +509,68 @@ async def create_virtual_account(
 
     full_name  = getattr(user, "full_name", None) or user.email.split("@")[0]
     name_parts = full_name.split(" ", 1)
-    email      = user.email
-    bvn        = getattr(user, "bvn", None) or "00000000000"  # BVN required by FLW; collect from user later
+    last_error = "Unknown error"
 
-    # Create virtual account with Flutterwave
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{FLW_BASE}/virtual-account-numbers",
-                json={
-                    "email":      email,
-                    "is_permanent": True,
-                    "bvn":        bvn,
-                    "tx_ref":     f"dva-{user.id}",
-                    "firstname":  name_parts[0],
-                    "lastname":   name_parts[1] if len(name_parts) > 1 else name_parts[0],
-                    "narration":  f"GFD — {full_name}",
-                },
-                headers=_flw_headers(),
+    # Try non-permanent first (no BVN needed), then permanent
+    for is_permanent in [False, True]:
+        tx_ref  = f"dva-gfd-{uuid4().hex[:12]}"
+        payload = {
+            "email":        user.email,
+            "is_permanent": is_permanent,
+            "tx_ref":       tx_ref,
+            "amount":       500,
+            "currency":     "NGN",
+            "narration":    f"GFD Wallet — {full_name}",
+            "firstname":    name_parts[0],
+            "lastname":     name_parts[1] if len(name_parts) > 1 else name_parts[0],
+            "phonenumber":  getattr(user, "phone", "") or "",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{FLW_BASE}/virtual-account-numbers",
+                    json=payload,
+                    headers=_flw_headers(),
+                )
+        except Exception as e:
+            raise HTTPException(502, f"Could not reach payment gateway: {e}")
+
+        print(f"[DVA] permanent={is_permanent} status={resp.status_code} body={resp.text[:400]}")
+        flw = resp.json() if resp.content else {}
+
+        if resp.status_code in (200, 201) and flw.get("status") == "success":
+            data           = flw["data"]
+            bank_name      = data.get("bank_name", "Flutterwave Bank")
+            account_number = data.get("account_number", "")
+            account_name   = data.get("account_name", full_name)
+            order_ref      = data.get("order_ref", data.get("flw_ref", tx_ref))
+
+            await db.execute(
+                text("""
+                    INSERT INTO virtual_accounts
+                        (id, user_id, bank_name, account_name, account_number, provider, customer_code, created_at)
+                    VALUES (gen_random_uuid(), CAST(:uid AS UUID), :bn, :an, :anum, 'flutterwave', :cc, NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                        SET account_number = EXCLUDED.account_number, bank_name = EXCLUDED.bank_name
+                """),
+                {"uid": str(user.id), "bn": bank_name, "an": account_name,
+                 "anum": account_number, "cc": order_ref},
             )
-    except Exception as e:
-        raise HTTPException(502, f"Could not create virtual account: {e}")
+            return {
+                "virtual_account": {
+                    "bank_name": bank_name, "account_name": account_name, "account_number": account_number,
+                },
+                "message": f"Your {bank_name} account number is ready!",
+            }
 
-    flw = resp.json()
-    if resp.status_code not in (200, 201) or flw.get("status") != "success":
-        msg = flw.get("message", resp.text[:300])
-        # If BVN not provided or account type not supported, give clear message
-        if "bvn" in msg.lower():
-            raise HTTPException(503, "BVN required to create a virtual account. Please add your BVN in Settings.")
-        raise HTTPException(502, f"Virtual account error: {msg}")
+        last_error = flw.get("message", resp.text[:300])
+        # If it's a feature-not-enabled error, stop trying
+        if any(w in last_error.lower() for w in ["not enabled", "not available", "not supported", "not activated"]):
+            raise HTTPException(503, "Virtual accounts are not enabled on this Flutterwave account. "
+                                     "Go to Flutterwave Dashboard → Virtual Accounts to activate.")
 
-    data           = flw["data"]
-    bank_name      = data.get("bank_name", "Flutterwave")
-    account_number = data.get("account_number", "")
-    account_name   = data.get("account_name", full_name)
-    order_ref      = data.get("order_ref", "")
-
-    # Save to DB
-    await db.execute(
-        text("""INSERT INTO virtual_accounts
-                    (id, user_id, bank_name, account_name, account_number, provider, customer_code, created_at)
-                VALUES (gen_random_uuid(), CAST(:uid AS UUID), :bn, :an, :anum, 'flutterwave', :cc, NOW())
-                ON CONFLICT (user_id) DO UPDATE
-                    SET account_number = EXCLUDED.account_number, bank_name = EXCLUDED.bank_name"""),
-        {"uid": str(user.id), "bn": bank_name, "an": account_name, "anum": account_number, "cc": order_ref},
-    )
-
-    return {
-        "virtual_account": {"bank_name": bank_name, "account_name": account_name, "account_number": account_number},
-        "message": f"Your dedicated {bank_name} account has been created!",
-    }
+    raise HTTPException(502, f"Could not create virtual account: {last_error}")
 
 @router.get("/banks")
 async def get_banks(user: User = Depends(get_current_active_user)):
