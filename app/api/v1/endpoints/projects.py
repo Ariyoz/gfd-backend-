@@ -149,20 +149,47 @@ async def list_my_projects(
     count_result = await db.execute(select(func.count()).select_from(Project).where(Project.client_id == client_profile.id))
     total = count_result.scalar() or 0
 
+    # Fetch URL columns via raw SQL (may not be in ORM model yet)
+    project_list = [{
+        "id": str(p.id),
+        "title": p.title,
+        "description": p.description,
+        "skills_needed": p.skills_needed or [],
+        "status": p.status.value if p.status else "open",
+        "project_type": p.project_type.value if p.project_type else "contract",
+        "deadline": p.deadline,
+        "view_count": p.view_count or 0,
+        "like_count": p.like_count or 0,
+        "cover_image": p.cover_image or "",
+        "created_at": str(p.created_at),
+        "live_url": "",
+        "github_url": "",
+        "repository_url": getattr(p, "repository_url", "") or "",
+    } for p in projects]
+
+    if project_list:
+        from sqlalchemy import text as sql_text
+        pid_list = [p["id"] for p in project_list]
+        try:
+            url_rows = await db.execute(sql_text("""
+                SELECT id::text,
+                       COALESCE(live_url, '')        AS live_url,
+                       COALESCE(github_url, '')      AS github_url,
+                       COALESCE(repository_url, '')  AS repository_url
+                FROM projects
+                WHERE id::text = ANY(:ids)
+            """), {"ids": pid_list})
+            url_map = {r[0]: (r[1], r[2], r[3]) for r in url_rows.fetchall()}
+            for p in project_list:
+                extra = url_map.get(p["id"], ("", "", ""))
+                p["live_url"]        = extra[0] or ""
+                p["github_url"]      = extra[1] or ""
+                p["repository_url"]  = extra[2] or p["repository_url"] or ""
+        except Exception:
+            pass  # columns may not exist on older DB
+
     return {
-        "projects": [{
-            "id": str(p.id),
-            "title": p.title,
-            "description": p.description,
-            "skills_needed": p.skills_needed or [],
-            "status": p.status.value if p.status else "open",
-            "project_type": p.project_type.value if p.project_type else "contract",
-            "deadline": p.deadline,
-            "view_count": p.view_count or 0,
-            "like_count": p.like_count or 0,
-            "cover_image": p.cover_image,
-            "created_at": str(p.created_at),
-        } for p in projects],
+        "projects": project_list,
         "total": total,
         "page": page,
     }
