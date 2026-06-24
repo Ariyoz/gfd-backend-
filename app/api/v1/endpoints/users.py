@@ -293,3 +293,76 @@ async def get_following(user_id: str, page: int = Query(1), limit: int = Query(2
         } for u in users],
         "total": len(users),
     }
+
+
+@router.get("/me/analytics")
+async def get_my_analytics(
+    period: int = Query(7, ge=1, le=90),
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get current user's analytics: profile views, post count, follower growth, job applications."""
+    from sqlalchemy import text
+
+    uid = str(user.id)
+
+    # Post count
+    post_count = (await db.execute(
+        select(func.count()).where(Post.author_id == user.id)
+    )).scalar() or 0
+
+    # Follower count
+    follower_count = (await db.execute(
+        select(func.count()).where(Follow.following_id == user.id)
+    )).scalar() or 0
+
+    # Job applications received (if poster)
+    result = await db.execute(text("""
+        SELECT COUNT(*) FROM job_applications ja
+        JOIN jobs j ON j.id = ja.job_id
+        WHERE j.poster_id = CAST(:uid AS UUID)
+    """), {"uid": uid})
+    job_requests = int(result.scalar() or 0)
+
+    # Job applications submitted (as applicant)
+    result2 = await db.execute(text("""
+        SELECT COUNT(*) FROM job_applications
+        WHERE applicant_id = CAST(:uid AS UUID)
+    """), {"uid": uid})
+    applications_submitted = int(result2.scalar() or 0)
+
+    # Posts per day for last `period` days
+    result3 = await db.execute(text("""
+        SELECT
+            DATE(created_at) AS day,
+            COUNT(*)          AS posts
+        FROM posts
+        WHERE author_id = CAST(:uid AS UUID)
+          AND created_at >= NOW() - INTERVAL ':period days'
+        GROUP BY day
+        ORDER BY day ASC
+    """.replace(":period days", f"{period} days")), {"uid": uid})
+    daily_posts = {str(row[0]): int(row[1]) for row in result3.fetchall()}
+
+    # Build chart data (last `period` days)
+    from datetime import date, timedelta
+    chart = []
+    for i in range(period - 1, -1, -1):
+        day = date.today() - timedelta(days=i)
+        day_str = str(day)
+        label = day.strftime("%a") if period <= 14 else day.strftime("%b %d")
+        chart.append({
+            "label":  label,
+            "date":   day_str,
+            "posts":  daily_posts.get(day_str, 0),
+            "views":  0,  # profile views would need a separate tracking table
+        })
+
+    return {
+        "post_count":             post_count,
+        "follower_count":         follower_count,
+        "job_requests":           job_requests,
+        "applications_submitted": applications_submitted,
+        "chart":                  chart,
+        "period":                 period,
+    }
