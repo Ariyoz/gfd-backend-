@@ -148,38 +148,46 @@ async def list_my_projects(
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_project(data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
     """Create a new project (any authenticated user)."""
+    if not data.get("title"):
+        raise HTTPException(status_code=400, detail="Project title is required")
+
     # Get or create client profile for this user
     result = await db.execute(select(ClientProfile).where(ClientProfile.user_id == user.id))
     client_profile = result.scalar_one_or_none()
 
     if not client_profile:
-        # Auto-create client profile for developers who want to post projects
+        # Auto-create client profile for any user who wants to post projects
         client_profile = ClientProfile(user_id=user.id)
         db.add(client_profile)
         await db.flush()
 
-    project = Project(
-        client_id=client_profile.id,
-        title=data["title"],
-        description=data.get("description", ""),
-        requirements=data.get("requirements"),
-        skills_needed=data.get("skills_needed", []),
-        budget_min=data.get("budget_min"),
-        budget_max=data.get("budget_max"),
-        duration=data.get("duration"),
-        experience_level=data.get("experience_level"),
-        cover_image=data.get("cover_image"),
-    )
-    # Set repository_url safely (column added in Phase 2 migration)
     try:
-        repo = data.get("repository_url") or data.get("github_url") or data.get("live_url")
-        if repo:
-            project.repository_url = repo
-    except Exception:
-        pass
-    db.add(project)
-    await db.flush()
-    return {"id": str(project.id), "message": "Project created"}
+        project = Project(
+            client_id=client_profile.id,
+            title=data["title"].strip(),
+            description=data.get("description", ""),
+            requirements=data.get("requirements"),
+            skills_needed=data.get("skills_needed") or [],
+            budget_min=data.get("budget_min"),
+            budget_max=data.get("budget_max"),
+            duration=data.get("duration"),
+            experience_level=data.get("experience_level"),
+            cover_image=data.get("cover_image"),
+        )
+        # Set optional fields safely
+        for field in ("repository_url", "github_url", "live_url"):
+            val = data.get(field)
+            if val:
+                try:
+                    setattr(project, field, val)
+                except Exception:
+                    pass
+        db.add(project)
+        await db.flush()
+        return {"id": str(project.id), "message": "Project published successfully"}
+    except Exception as e:
+        print(f"[ERROR] Create project failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to publish project: {str(e)}")
 
 
 @router.get("/{project_id}")
