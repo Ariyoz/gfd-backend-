@@ -401,33 +401,39 @@ async def upload_message_attachment(
         "application/zip", "application/x-zip-compressed",
         # Voice notes
         "audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav",
+        # Video messages
+        "video/mp4", "video/webm", "video/quicktime", "video/x-msvideo",
+        "video/3gpp", "video/mpeg",
     }
-    MAX_SIZE = 20 * 1024 * 1024
+    MAX_SIZE = 50 * 1024 * 1024  # 50MB for videos
 
     if file.content_type not in ALLOWED:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Allowed: images, PDF, ZIP")
+        raise HTTPException(status_code=400, detail="Unsupported file type. Allowed: images, videos, PDF, ZIP, audio")
 
     content = await file.read()
     if len(content) > MAX_SIZE:
-        raise HTTPException(status_code=400, detail="File too large. Maximum is 20 MB.")
+        raise HTTPException(status_code=400, detail="File too large. Maximum is 50 MB.")
 
     try:
         import cloudinary.uploader
         is_image = file.content_type.startswith("image/")
         is_audio = file.content_type.startswith("audio/")
-        resource_type = "image" if is_image else "video" if is_audio else "raw"
+        is_video = file.content_type.startswith("video/")
+        # Cloudinary resource_type: image, video (also handles audio), raw
+        resource_type = "image" if is_image else "video" if (is_video or is_audio) else "raw"
         result = cloudinary.uploader.upload(
             content,
             folder=f"gfd/messages/{user.id}",
             resource_type=resource_type,
         )
         return {
-            "url": result["secure_url"],
+            "url":       result["secure_url"],
             "file_name": file.filename,
             "file_size": len(content),
             "file_type": file.content_type,
-            "is_image": is_image,
-            "is_audio": is_audio,
+            "is_image":  is_image,
+            "is_audio":  is_audio,
+            "is_video":  is_video,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
