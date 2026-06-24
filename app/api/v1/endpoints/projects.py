@@ -174,16 +174,21 @@ async def create_project(data: dict, user: User = Depends(get_current_active_use
             experience_level=data.get("experience_level"),
             cover_image=data.get("cover_image"),
         )
-        # Set optional fields safely
-        for field in ("repository_url", "github_url", "live_url"):
-            val = data.get(field)
-            if val:
-                try:
-                    setattr(project, field, val)
-                except Exception:
-                    pass
         db.add(project)
         await db.flush()
+
+        # Set repository_url via raw SQL to avoid column-not-found issues on old DBs
+        repo_url = data.get("repository_url") or data.get("github_url") or data.get("live_url")
+        if repo_url:
+            from sqlalchemy import text
+            try:
+                await db.execute(
+                    text("UPDATE projects SET repository_url = :url WHERE id = :pid"),
+                    {"url": repo_url, "pid": str(project.id)}
+                )
+            except Exception:
+                pass  # column might not exist on older deployments
+
         return {"id": str(project.id), "message": "Project published successfully"}
     except Exception as e:
         print(f"[ERROR] Create project failed: {e}")

@@ -163,6 +163,50 @@ async def lifespan(app: FastAPI):
                         WHERE table_name='projects' AND column_name='repository_url') THEN
                         ALTER TABLE projects ADD COLUMN repository_url TEXT;
                     END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='projects' AND column_name='cover_image') THEN
+                        ALTER TABLE projects ADD COLUMN cover_image TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='projects' AND column_name='view_count') THEN
+                        ALTER TABLE projects ADD COLUMN view_count INTEGER DEFAULT 0;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='projects' AND column_name='like_count') THEN
+                        ALTER TABLE projects ADD COLUMN like_count INTEGER DEFAULT 0;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='messages' AND column_name='status') THEN
+                        ALTER TABLE messages ADD COLUMN status VARCHAR(20) DEFAULT 'sent';
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='messages' AND column_name='is_edited') THEN
+                        ALTER TABLE messages ADD COLUMN is_edited BOOLEAN DEFAULT FALSE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='messages' AND column_name='is_deleted') THEN
+                        ALTER TABLE messages ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='messages' AND column_name='reply_to_id') THEN
+                        ALTER TABLE messages ADD COLUMN reply_to_id UUID;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='messages' AND column_name='media_url') THEN
+                        ALTER TABLE messages ADD COLUMN media_url TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='messages' AND column_name='file_name') THEN
+                        ALTER TABLE messages ADD COLUMN file_name TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='messages' AND column_name='file_size') THEN
+                        ALTER TABLE messages ADD COLUMN file_size INTEGER;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='conversation_participants' AND column_name='unread_count') THEN
+                        ALTER TABLE conversation_participants ADD COLUMN unread_count INTEGER DEFAULT 0;
+                    END IF;
                 END $$;
             """))
         print("✅ Database columns verified")
