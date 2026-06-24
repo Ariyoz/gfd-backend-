@@ -235,20 +235,30 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── Middleware ──
+# ── CORS must be added FIRST (outermost middleware — runs before everything else) ──
+# This ensures preflight OPTIONS requests always get Access-Control-Allow-Origin headers
+_CORS_ORIGINS = list(set(
+    settings.cors_origins
+    + ["https://globalfd.xyz", "https://www.globalfd.xyz",
+       "http://localhost:5173", "http://localhost:3000"]
+))
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
+)
+
+# ── Security + logging middleware (added AFTER CORS so they run inside CORS) ──
 from app.middleware.security import SecurityHeadersMiddleware, RequestIDMiddleware, RequestLoggingMiddleware, InputSanitizationMiddleware
 
 app.add_middleware(InputSanitizationMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins + ["https://globalfd.xyz", "https://www.globalfd.xyz"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Rate limiting
 app.state.limiter = limiter

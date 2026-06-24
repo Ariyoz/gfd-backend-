@@ -14,6 +14,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Add comprehensive security headers to all responses."""
 
     async def dispatch(self, request: Request, call_next):
+        # Let preflight OPTIONS pass straight through — CORS middleware handles it
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         response = await call_next(request)
         # Prevent MIME sniffing
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -34,8 +38,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if '/auth/' in request.url.path or '/admin/' in request.url.path:
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
             response.headers["Pragma"] = "no-cache"
-        # Cross-Origin policies
-        response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+        # Cross-Origin policies — allow cross-origin fetches from our frontend
         response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
         return response
 

@@ -1,6 +1,6 @@
 """Project hiring endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from uuid import UUID
@@ -317,61 +317,79 @@ async def like_project(project_id: str, user: User = Depends(get_current_active_
     """Toggle like on a project — one like per user, can unlike."""
     from sqlalchemy import update, text
 
+    try:
+        UUID(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+
+    # Verify project exists
+    proj_check = await db.execute(text(
+        "SELECT id FROM projects WHERE id = CAST(:pid AS UUID)"
+    ), {"pid": project_id})
+    if not proj_check.fetchone():
+        raise HTTPException(status_code=404, detail="Project not found")
+
     # Check if user already liked this project
     check = await db.execute(text(
-        "SELECT id FROM project_likes WHERE project_id = :pid AND user_id = :uid"
+        "SELECT id FROM project_likes WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)"
     ), {"pid": project_id, "uid": str(user.id)})
     existing = check.fetchone()
 
     if existing:
         # Unlike — remove the like
         await db.execute(text(
-            "DELETE FROM project_likes WHERE project_id = :pid AND user_id = :uid"
+            "DELETE FROM project_likes WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)"
         ), {"pid": project_id, "uid": str(user.id)})
         await db.execute(
-            update(Project).where(Project.id == UUID(project_id)).values(like_count=Project.like_count - 1)
+            update(Project).where(Project.id == UUID(project_id))
+            .values(like_count=Project.like_count - 1)
         )
         return {"message": "Project unliked", "liked": False}
     else:
         # Like — add the like
         await db.execute(text(
-            "INSERT INTO project_likes (project_id, user_id) VALUES (:pid, :uid)"
+            "INSERT INTO project_likes (project_id, user_id) VALUES (CAST(:pid AS UUID), CAST(:uid AS UUID)) ON CONFLICT DO NOTHING"
         ), {"pid": project_id, "uid": str(user.id)})
         await db.execute(
-            update(Project).where(Project.id == UUID(project_id)).values(like_count=Project.like_count + 1)
+            update(Project).where(Project.id == UUID(project_id))
+            .values(like_count=Project.like_count + 1)
         )
         return {"message": "Project liked", "liked": True}
 
 
 @router.post("/{project_id}/view")
-async def view_project(project_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Record a project view — one view per user."""
+async def view_project(project_id: str, db: AsyncSession = Depends(get_db), request: Request = None):
+    """Record a project view — works with or without auth. One view per user (auth) or just increments (anon)."""
+    from fastapi import Request as FastAPIRequest
     from sqlalchemy import update, text
 
-    # Check if user already viewed this project
-    check = await db.execute(text(
-        "SELECT id FROM project_views WHERE project_id = :pid AND user_id = :uid"
-    ), {"pid": project_id, "uid": str(user.id)})
-    existing = check.fetchone()
+    # Try to get user from auth header if present — but don't require it
+    auth_user_id = None
+    try:
+        from fastapi.security import HTTPBearer
+        from app.core.security import decode_token
+        if request:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header.split(" ", 1)[1]
+                payload = decode_token(token)
+                if payload:
+                    auth_user_id = payload.get("sub")
+    except Exception:
+        pass
 
-    if existing:
-        return {"message": "Already viewed"}
+    if auth_user_id:
+        # Authenticated — one view per user
+        check = await db.execute(text(
+            "SELECT id FROM project_views WHERE project_id = :pid AND user_id = :uid"
+        ), {"pid": project_id, "uid": auth_user_id})
+        if check.fetchone():
+            return {"message": "Already viewed"}
+        await db.execute(text(
+            "INSERT INTO project_views (project_id, user_id) VALUES (:pid, :uid)"
+        ), {"pid": project_id, "uid": auth_user_id})
 
-    # Record view
-    await db.execute(text(
-        "INSERT INTO project_views (project_id, user_id) VALUES (:pid, :uid)"
-    ), {"pid": project_id, "uid": str(user.id)})
-    await db.execute(
-        update(Project).where(Project.id == UUID(project_id)).values(view_count=Project.view_count + 1)
-    )
-    return {"message": "View recorded"}
-
-
-# ── Allow view without auth (uses raw SQL to avoid auth requirement) ──
-@router.post("/{project_id}/view/public")
-async def view_project_public(project_id: str, db: AsyncSession = Depends(get_db)):
-    """Record a project view for anonymous visitors."""
-    from sqlalchemy import update, text
+    # Always increment view count (for anon visitors too)
     try:
         await db.execute(
             update(Project).where(Project.id == UUID(project_id))
