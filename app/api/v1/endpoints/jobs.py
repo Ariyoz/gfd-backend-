@@ -160,6 +160,64 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
         raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
 
 
+# ── MUST be before /{job_id} so FastAPI matches it correctly ──
+@router.get("/my-applications")
+async def my_applications(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all job applications submitted by the current user."""
+    from sqlalchemy import text
+
+    result = await db.execute(text("""
+        SELECT
+            ja.id, ja.job_id, ja.status,
+            ja.cover_letter, ja.resume_url, ja.portfolio_url,
+            ja.linkedin_url, ja.github_url,
+            ja.years_experience, ja.expected_salary, ja.availability,
+            ja.created_at, ja.updated_at,
+            j.title AS job_title, j.company AS job_company,
+            j.job_type, j.location, j.salary_min, j.salary_max, j.salary_currency,
+            u.full_name AS poster_name, u.avatar AS poster_avatar
+        FROM job_applications ja
+        JOIN jobs  j ON j.id  = ja.job_id
+        JOIN users u ON u.id  = j.poster_id
+        WHERE ja.applicant_id = CAST(:user_id AS UUID)
+        ORDER BY ja.created_at DESC
+    """), {"user_id": str(user.id)})
+
+    rows = result.mappings().all()
+    return {
+        "applications": [
+            {
+                "id":               str(row["id"]),
+                "job_id":           str(row["job_id"]),
+                "status":           row["status"] or "pending",
+                "cover_letter":     row["cover_letter"] or "",
+                "resume_url":       row["resume_url"] or "",
+                "portfolio_url":    row["portfolio_url"] or "",
+                "linkedin_url":     row["linkedin_url"] or "",
+                "github_url":       row["github_url"] or "",
+                "years_experience": row["years_experience"],
+                "expected_salary":  row["expected_salary"],
+                "availability":     row["availability"] or "",
+                "created_at":       str(row["created_at"]),
+                "updated_at":       str(row["updated_at"]),
+                "job_title":        row["job_title"] or "",
+                "job_company":      row["job_company"] or "",
+                "job_type":         row["job_type"] or "",
+                "location":         row["location"] or "",
+                "salary_min":       row["salary_min"],
+                "salary_max":       row["salary_max"],
+                "salary_currency":  row["salary_currency"] or "USD",
+                "poster_name":      row["poster_name"] or "",
+                "poster_avatar":    row["poster_avatar"] or "",
+            }
+            for row in rows
+        ]
+    }
+
+
 @router.get("/{job_id}")
 async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
     """Get job details."""
@@ -344,140 +402,3 @@ async def update_application_status(application_id: str, data: dict, user: User 
     ))
 
     return {"message": f"Application {new_status}"}
-
-
-@router.get("/my-applications")
-async def my_applications(
-    user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get all job applications submitted by the current user."""
-    from sqlalchemy import text
-
-    result = await db.execute(text("""
-        SELECT
-            ja.id,
-            ja.job_id,
-            ja.status,
-            ja.cover_letter,
-            ja.resume_url,
-            ja.portfolio_url,
-            ja.linkedin_url,
-            ja.github_url,
-            ja.years_experience,
-            ja.expected_salary,
-            ja.availability,
-            ja.created_at,
-            ja.updated_at,
-            j.title        AS job_title,
-            j.company      AS job_company,
-            j.job_type,
-            j.location,
-            j.salary_min,
-            j.salary_max,
-            j.salary_currency,
-            u.full_name    AS poster_name,
-            u.avatar       AS poster_avatar
-        FROM job_applications ja
-        JOIN jobs  j ON j.id  = ja.job_id
-        JOIN users u ON u.id  = j.poster_id
-        WHERE ja.applicant_id = CAST(:user_id AS UUID)
-        ORDER BY ja.created_at DESC
-    """), {"user_id": str(user.id)})
-
-    rows = result.mappings().all()
-    return {
-        "applications": [
-            {
-                "id":               str(row["id"]),
-                "job_id":           str(row["job_id"]),
-                "status":           row["status"] or "pending",
-                "cover_letter":     row["cover_letter"] or "",
-                "resume_url":       row["resume_url"] or "",
-                "portfolio_url":    row["portfolio_url"] or "",
-                "linkedin_url":     row["linkedin_url"] or "",
-                "github_url":       row["github_url"] or "",
-                "years_experience": row["years_experience"],
-                "expected_salary":  row["expected_salary"],
-                "availability":     row["availability"] or "",
-                "created_at":       str(row["created_at"]),
-                "updated_at":       str(row["updated_at"]),
-                "job_title":        row["job_title"] or "",
-                "job_company":      row["job_company"] or "",
-                "job_type":         row["job_type"] or "",
-                "location":         row["location"] or "",
-                "salary_min":       row["salary_min"],
-                "salary_max":       row["salary_max"],
-                "salary_currency":  row["salary_currency"] or "USD",
-                "poster_name":      row["poster_name"] or "",
-                "poster_avatar":    row["poster_avatar"] or "",
-            }
-            for row in rows
-        ]
-    }
-
-
-@router.get("/{job_id}/applications")
-async def get_job_applications(
-    job_id: str,
-    user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get all applications for a specific job. Only accessible by the job poster."""
-    from sqlalchemy import text
-
-    # Verify ownership
-    job = await db.execute(
-        text("SELECT poster_id FROM jobs WHERE id = :job_id"),
-        {"job_id": job_id},
-    )
-    job_row = job.fetchone()
-    if not job_row:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if str(job_row[0]) != str(user.id):
-        raise HTTPException(status_code=403, detail="Not authorized to view these applications")
-
-    result = await db.execute(text("""
-        SELECT
-            ja.id,
-            ja.status,
-            ja.cover_letter,
-            ja.resume_url,
-            ja.portfolio_url,
-            ja.linkedin_url,
-            ja.github_url,
-            ja.years_experience,
-            ja.expected_salary,
-            ja.availability,
-            ja.created_at,
-            u.full_name  AS applicant_name,
-            u.avatar     AS applicant_avatar,
-            u.id         AS applicant_id
-        FROM job_applications ja
-        JOIN users u ON u.id = ja.applicant_id
-        WHERE ja.job_id = :job_id
-        ORDER BY ja.created_at DESC
-    """), {"job_id": job_id})
-
-    rows = result.mappings().all()
-    return {
-        "applications": [
-            {
-                "id":               str(row["id"]),
-                "status":           row["status"] or "pending",
-                "cover_letter":     row["cover_letter"] or "",
-                "resume_url":       row["resume_url"] or "",
-                "portfolio_url":    row["portfolio_url"] or "",
-                "linkedin_url":     row["linkedin_url"] or "",
-                "github_url":       row["github_url"] or "",
-                "years_experience": row["years_experience"],
-                "expected_salary":  row["expected_salary"],
-                "availability":     row["availability"] or "",
-                "created_at":       str(row["created_at"]),
-                "applicant_name":   row["applicant_name"] or "Unknown",
-                "applicant_avatar": row["applicant_avatar"] or "",
-                "applicant_id":     str(row["applicant_id"]),
-            }
-            for row in rows
-        ]
-    }
