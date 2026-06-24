@@ -53,7 +53,11 @@ class Settings(BaseSettings):
     PAYSTACK_SECRET_KEY: str = ""
     PAYSTACK_PUBLIC_KEY: str = ""
 
-    # ── Frontend ──
+    # ── Flutterwave ──
+    FLW_SECRET_KEY: str = ""
+    FLW_PUBLIC_KEY: str = ""
+
+    # ── Frontend URL (used for payment callbacks) ──
     FRONTEND_URL: str = "https://www.globalfd.xyz"
 
     # ── Celery ──

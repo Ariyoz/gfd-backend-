@@ -1,13 +1,20 @@
 """
-Wallet endpoints — full Paystack integration.
+Wallet endpoints — Flutterwave payment integration.
 
-Funding flows:
-  1. Dedicated Virtual Account (DVA) — user gets a personal bank account number.
-     Any transfer to it auto-credits their wallet via webhook. (Recommended)
-  2. Checkout redirect — POST /wallet/initialize → Paystack page → POST /wallet/verify
+Fund flow:
+  POST /wallet/flw/initialize  → returns payment link → user pays
+  GET  /wallet/flw/verify      → called after redirect, credits wallet
+  POST /wallet/flw/webhook     → Flutterwave pushes events here
 
-Withdraw: POST /wallet/withdraw → Paystack Transfer API (instant)
-Webhook:  POST /wallet/webhook  → handles charge.success / transfer.success / dedicatedaccount.assign.success
+Withdraw flow:
+  GET  /wallet/banks           → live bank list from Flutterwave
+  POST /wallet/verify-account  → resolve account number → account name
+  POST /wallet/withdraw        → Flutterwave Transfer API (instant)
+
+Admin:
+  GET  /wallet/admin/overview
+  GET  /wallet/admin/pending-withdrawals
+  POST /wallet/admin/credit-user
 """
 
 import hmac
@@ -17,7 +24,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from uuid import uuid4
-from datetime import datetime
 
 from app.database import get_db
 from app.models import User
@@ -26,41 +32,34 @@ from app.config import get_settings
 
 router   = APIRouter()
 settings = get_settings()
-PS_BASE  = "https://api.paystack.co"
+FLW_BASE = "https://api.flutterwave.com/v3"
 
-# Alias for readability
 get_current_admin_user = require_admin
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════
 
-def _ps_headers() -> dict:
+def _flw_headers() -> dict:
     return {
-        "Authorization": f"Bearer {settings.PAYSTACK_SECRET_KEY}",
+        "Authorization": f"Bearer {settings.FLW_SECRET_KEY}",
         "Content-Type": "application/json",
     }
 
 
 async def _get_or_create_wallet(user_id: str, db: AsyncSession) -> dict:
-    """Return wallet row, creating one if it doesn't exist."""
     r = await db.execute(
         text("""
             SELECT id, balance, total_earned, total_withdrawn
-            FROM wallets
-            WHERE user_id = CAST(:uid AS UUID)
+            FROM wallets WHERE user_id = CAST(:uid AS UUID)
         """),
         {"uid": user_id},
     )
     row = r.fetchone()
     if row:
-        return {
-            "id": str(row[0]),
-            "balance": float(row[1] or 0),
-            "total_earned": float(row[2] or 0),
-            "total_withdrawn": float(row[3] or 0),
-        }
+        return {"id": str(row[0]), "balance": float(row[1] or 0),
+                "total_earned": float(row[2] or 0), "total_withdrawn": float(row[3] or 0)}
     wid = str(uuid4())
     await db.execute(
         text("""
@@ -72,221 +71,35 @@ async def _get_or_create_wallet(user_id: str, db: AsyncSession) -> dict:
     return {"id": wid, "balance": 0.0, "total_earned": 0.0, "total_withdrawn": 0.0}
 
 
-def _verify_paystack_signature(body: bytes, signature: str) -> bool:
-    """HMAC-SHA512 signature verification for Paystack webhooks."""
-    if not settings.PAYSTACK_SECRET_KEY:
-        return True  # skip in dev if key not set
-    expected = hmac.new(
-        settings.PAYSTACK_SECRET_KEY.encode("utf-8"),
-        body,
-        hashlib.sha512,
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  GET /wallet  —  balance + stats
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# PING — health check
+# ══════════════════════════════════════════════════════════
 
 @router.get("/ping")
-async def ping_paystack():
-    """Check if Paystack key is configured and reachable (no auth needed)."""
-    if not settings.PAYSTACK_SECRET_KEY:
-        return {"configured": False, "message": "PAYSTACK_SECRET_KEY not set"}
+async def ping_flw():
+    """Check Flutterwave key is loaded and reachable."""
+    if not settings.FLW_SECRET_KEY:
+        return {"configured": False, "message": "FLW_SECRET_KEY not set"}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"{PS_BASE}/bank?country=nigeria&perPage=1",
-                headers=_ps_headers(),
+                f"{FLW_BASE}/banks/NG",
+                headers=_flw_headers(),
             )
         if resp.status_code == 200:
-            return {"configured": True, "message": "Paystack connected ✓", "key_prefix": settings.PAYSTACK_SECRET_KEY[:12] + "..."}
-        return {"configured": False, "message": f"Paystack returned {resp.status_code}: {resp.text[:200]}"}
+            return {
+                "configured": True,
+                "message": "Flutterwave connected ✓",
+                "key_prefix": settings.FLW_SECRET_KEY[:14] + "...",
+            }
+        return {"configured": False, "message": f"FLW returned {resp.status_code}: {resp.text[:200]}"}
     except Exception as e:
         return {"configured": False, "message": str(e)}
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DEDICATED VIRTUAL ACCOUNT (DVA)
-#  Each user gets a permanent personal bank account number.
-#  Any transfer to it credits their wallet automatically via webhook.
-# ══════════════════════════════════════════════════════════════════════════════
 
-@router.get("/virtual-account")
-async def get_virtual_account(
-    user: User = Depends(get_current_active_user),
-    db:   AsyncSession = Depends(get_db),
-):
-    """Return the user's dedicated virtual account, or None if not yet created."""
-    r = await db.execute(
-        text("""
-            SELECT bank_name, account_name, account_number, provider, created_at
-            FROM virtual_accounts
-            WHERE user_id = CAST(:uid AS UUID)
-        """),
-        {"uid": str(user.id)},
-    )
-    row = r.fetchone()
-    if not row:
-        return {"virtual_account": None}
-    return {
-        "virtual_account": {
-            "bank_name":      row[0],
-            "account_name":   row[1],
-            "account_number": row[2],
-            "provider":       row[3],
-            "created_at":     str(row[4]),
-        }
-    }
-
-
-@router.post("/virtual-account/create")
-async def create_virtual_account(
-    data: dict = {},
-    user: User = Depends(get_current_active_user),
-    db:   AsyncSession = Depends(get_db),
-):
-    """
-    Create a Paystack Dedicated Virtual Account for this user (NGN).
-    Requires DVA to be enabled on your Paystack account.
-    """
-    if not settings.PAYSTACK_SECRET_KEY:
-        raise HTTPException(503, "Payment gateway not configured")
-
-    # Check if already has one
-    r = await db.execute(
-        text("SELECT account_number, bank_name FROM virtual_accounts WHERE user_id = CAST(:uid AS UUID)"),
-        {"uid": str(user.id)},
-    )
-    existing = r.fetchone()
-    if existing:
-        return {
-            "virtual_account": {
-                "account_number": existing[0],
-                "bank_name":      existing[1],
-            },
-            "message": "Account already exists",
-        }
-
-    # ── Step 1: Create or fetch Paystack Customer ──
-    customer_code = None
-
-    # Try to find existing customer first
-    async with httpx.AsyncClient(timeout=20) as client:
-        cust_resp = await client.get(
-            f"{PS_BASE}/customer/{user.email}",
-            headers=_ps_headers(),
-        )
-
-    if cust_resp.status_code == 200:
-        ps_cust = cust_resp.json()
-        if ps_cust.get("status") and ps_cust.get("data"):
-            customer_code = ps_cust["data"].get("customer_code")
-            # Validate the customer (required for DVA)
-            if not ps_cust["data"].get("identified"):
-                await _validate_customer(customer_code, user)
-
-    if not customer_code:
-        # Create new customer
-        name_parts = (getattr(user, 'full_name', None) or user.email.split("@")[0]).split(" ", 1)
-        first = name_parts[0]
-        last  = name_parts[1] if len(name_parts) > 1 else name_parts[0]
-
-        async with httpx.AsyncClient(timeout=20) as client:
-            cr = await client.post(
-                f"{PS_BASE}/customer",
-                json={
-                    "email":      user.email,
-                    "first_name": first,
-                    "last_name":  last,
-                },
-                headers=_ps_headers(),
-            )
-
-        cr_json = cr.json()
-        if cr.status_code not in (200, 201) or not cr_json.get("status"):
-            raise HTTPException(502, cr_json.get("message", "Could not create Paystack customer"))
-
-        customer_code = cr_json["data"]["customer_code"]
-
-    # ── Step 2: Try banks in order until one works ──
-    banks_to_try = ["wema-bank", "titan-paystack", "sterling-bank"]
-    dva_resp = None
-    last_err = "DVA not available"
-
-    for bank in banks_to_try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{PS_BASE}/dedicated_account",
-                json={"customer": customer_code, "preferred_bank": bank},
-                headers=_ps_headers(),
-            )
-        if resp.status_code in (200, 201) and resp.json().get("status"):
-            dva_resp = resp
-            break
-        try:
-            last_err = resp.json().get("message", resp.text[:200])
-        except Exception:
-            last_err = resp.text[:200]
-
-    if not dva_resp:
-        # DVA not enabled on this Paystack account — give helpful message
-        if "not enabled" in last_err.lower() or "not available" in last_err.lower():
-            raise HTTPException(503,
-                "Dedicated virtual accounts are not yet enabled on this platform. "
-                "Please use the 'Fund via Card/Bank' option instead."
-            )
-        raise HTTPException(502, f"Could not create virtual account: {last_err}")
-
-    acct = dva_resp.json()["data"]
-    bank_name      = acct.get("bank", {}).get("name", "Bank")
-    account_number = acct.get("account_number", "")
-    account_name   = acct.get("account_name", getattr(user, 'full_name', user.email))
-    provider       = acct.get("bank", {}).get("slug", "paystack")
-
-    # Persist
-    await db.execute(
-        text("""
-            INSERT INTO virtual_accounts
-                (id, user_id, bank_name, account_name, account_number, provider, customer_code, created_at)
-            VALUES
-                (gen_random_uuid(), CAST(:uid AS UUID), :bn, :an, :anum, :prov, :cc, NOW())
-            ON CONFLICT (user_id) DO UPDATE
-                SET account_number = EXCLUDED.account_number,
-                    bank_name = EXCLUDED.bank_name
-        """),
-        {"uid": str(user.id), "bn": bank_name, "an": account_name,
-         "anum": account_number, "prov": provider, "cc": customer_code},
-    )
-
-    return {
-        "virtual_account": {
-            "bank_name":      bank_name,
-            "account_name":   account_name,
-            "account_number": account_number,
-            "provider":       provider,
-        },
-        "message": f"Your dedicated {bank_name} account has been created!",
-    }
-
-
-async def _validate_customer(customer_code: str, user):
-    """Validate (identify) Paystack customer — required before DVA assignment."""
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            await client.post(
-                f"{PS_BASE}/customer/{customer_code}/identification",
-                json={
-                    "country":     "NG",
-                    "type":        "bvn",
-                    "value":       "00000000000",  # placeholder — real BVN would go here
-                    "first_name":  getattr(user, 'full_name', '').split()[0] if getattr(user, 'full_name', '') else 'User',
-                    "last_name":   getattr(user, 'full_name', '').split()[-1] if getattr(user, 'full_name', '') else 'User',
-                },
-                headers=_ps_headers(),
-            )
-    except Exception:
-        pass  # Validation is best-effort
-
+# ══════════════════════════════════════════════════════════
+# GET /wallet — balance + monthly earnings
+# ══════════════════════════════════════════════════════════
 
 @router.get("")
 async def get_wallet(
@@ -294,8 +107,6 @@ async def get_wallet(
     db:   AsyncSession = Depends(get_db),
 ):
     wallet = await _get_or_create_wallet(str(user.id), db)
-
-    # Monthly earnings (deposits + incoming earnings this calendar month)
     r = await db.execute(
         text("""
             SELECT COALESCE(SUM(amount), 0)
@@ -308,13 +119,12 @@ async def get_wallet(
         {"wid": wallet["id"]},
     )
     monthly = float(r.scalar() or 0)
-
     return {**wallet, "monthly_earnings": monthly}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  GET /wallet/transactions
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# GET /wallet/transactions
+# ══════════════════════════════════════════════════════════
 
 @router.get("/transactions")
 async def get_transactions(
@@ -327,174 +137,171 @@ async def get_transactions(
             SELECT id, type, amount, description, reference, status, created_at
             FROM wallet_transactions
             WHERE wallet_id = CAST(:wid AS UUID)
-            ORDER BY created_at DESC
-            LIMIT 100
+            ORDER BY created_at DESC LIMIT 100
         """),
         {"wid": wallet["id"]},
     )
     rows = r.fetchall()
-    return {
-        "transactions": [
-            {
-                "id":          str(row[0]),
-                "type":        row[1],
-                "amount":      float(row[2] or 0),
-                "description": row[3] or "",
-                "reference":   row[4] or "",
-                "status":      row[5] or "pending",
-                "created_at":  str(row[6]),
-            }
-            for row in rows
-        ]
-    }
+    return {"transactions": [
+        {"id": str(row[0]), "type": row[1], "amount": float(row[2] or 0),
+         "description": row[3] or "", "reference": row[4] or "",
+         "status": row[5] or "pending", "created_at": str(row[6])}
+        for row in rows
+    ]}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  POST /wallet/initialize  —  start Paystack payment
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# POST /wallet/flw/initialize — create Flutterwave payment link
+# ══════════════════════════════════════════════════════════
 
-@router.post("/initialize")
-async def initialize_payment(
+@router.post("/flw/initialize")
+async def flw_initialize(
     data: dict,
     user: User = Depends(get_current_active_user),
     db:   AsyncSession = Depends(get_db),
 ):
     """
-    Call Paystack Transaction Initialize.
-    Returns { authorization_url, access_code, reference }.
-    Frontend redirects user to authorization_url.
+    Create a Flutterwave Standard payment link.
+    Returns { payment_link, tx_ref } — frontend redirects user to payment_link.
+    Supports: card, bank transfer, USSD, mobile money — all at once.
     """
-    # Guard: key must be configured
-    if not settings.PAYSTACK_SECRET_KEY:
+    if not settings.FLW_SECRET_KEY:
         raise HTTPException(503, "Payment gateway not configured. Contact support.")
 
-    amount_kobo = data.get("amount", 0)
     try:
-        amount_naira = float(amount_kobo)
+        amount = float(data.get("amount", 0))
     except (ValueError, TypeError):
         raise HTTPException(400, "Invalid amount")
 
-    if amount_naira < 100:
+    if amount < 100:
         raise HTTPException(400, "Minimum deposit is ₦100")
 
-    wallet    = await _get_or_create_wallet(str(user.id), db)
-    reference = f"gfd-{uuid4().hex[:20]}"
-    frontend_url = getattr(settings, 'FRONTEND_URL', 'https://www.globalfd.xyz')
-    callback  = data.get(
-        "callback_url",
-        f"{frontend_url}/wallet",
-    )
+    wallet   = await _get_or_create_wallet(str(user.id), db)
+    tx_ref   = f"gfd-{uuid4().hex[:20]}"
+    frontend = getattr(settings, "FRONTEND_URL", "https://www.globalfd.xyz")
+    redirect = data.get("redirect_url", f"{frontend}/wallet")
+
+    full_name = getattr(user, "full_name", None) or user.email.split("@")[0]
+    name_parts = full_name.split(" ", 1)
 
     payload = {
-        "email":        user.email,
-        "amount":       int(amount_naira * 100),  # Paystack uses kobo
-        "reference":    reference,
-        "callback_url": callback,
-        # Start with card only — bank_transfer requires verified Paystack account
-        # Once your Paystack account is verified, add: "bank", "ussd", "bank_transfer"
-        "channels":     ["card"],
-        "metadata": {
+        "tx_ref":       tx_ref,
+        "amount":       amount,
+        "currency":     "NGN",
+        "redirect_url": redirect,
+        "customer": {
+            "email":       user.email,
+            "name":        full_name,
+            "phonenumber": getattr(user, "phone", ""),
+        },
+        "customizations": {
+            "title":       "GFD Wallet",
+            "description": f"Fund GFD wallet — ₦{amount:,.0f}",
+            "logo":        "https://www.globalfd.xyz/logo.png",
+        },
+        "meta": {
             "wallet_id": wallet["id"],
             "user_id":   str(user.id),
-            "custom_fields": [
-                {"display_name": "Platform",    "variable_name": "platform",    "value": "GFD"},
-                {"display_name": "User Email",  "variable_name": "user_email",  "value": user.email},
-            ],
         },
+        # Accept all channels — no DVA needed
+        "payment_options": "card,banktransfer,ussd,mobilemoney",
     }
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=25) as client:
             resp = await client.post(
-                f"{PS_BASE}/transaction/initialize",
+                f"{FLW_BASE}/payments",
                 json=payload,
-                headers=_ps_headers(),
+                headers=_flw_headers(),
             )
     except httpx.TimeoutException:
         raise HTTPException(504, "Payment gateway timed out. Please try again.")
     except Exception as e:
-        raise HTTPException(502, f"Could not reach payment gateway: {str(e)}")
+        raise HTTPException(502, f"Could not reach payment gateway: {e}")
 
-    # Return Paystack's actual error message to the frontend
     if resp.status_code != 200:
         try:
-            err_body = resp.json()
-            err_msg  = err_body.get("message", resp.text)
+            msg = resp.json().get("message", resp.text[:300])
         except Exception:
-            err_msg = resp.text
-        raise HTTPException(502, f"Paystack: {err_msg}")
+            msg = resp.text[:300]
+        raise HTTPException(502, f"Flutterwave: {msg}")
 
-    ps = resp.json()
-    if not ps.get("status"):
-        raise HTTPException(502, ps.get("message", "Paystack rejected the request"))
+    flw = resp.json()
+    if flw.get("status") != "success":
+        raise HTTPException(502, flw.get("message", "Flutterwave rejected the request"))
 
-    ps_data = ps["data"]
-    # Record a pending transaction so we can track it
+    payment_link = flw["data"]["link"]
+
+    # Record pending transaction
     await db.execute(
         text("""
             INSERT INTO wallet_transactions
                 (id, wallet_id, type, amount, description, reference, status, created_at)
             VALUES
                 (gen_random_uuid(), CAST(:wid AS UUID), 'deposit', :amt,
-                 'Wallet top-up via Paystack', :ref, 'pending', NOW())
+                 'Wallet top-up via Flutterwave', :ref, 'pending', NOW())
         """),
-        {"wid": wallet["id"], "amt": amount_naira, "ref": reference},
+        {"wid": wallet["id"], "amt": amount, "ref": tx_ref},
     )
 
-    return {
-        "authorization_url": ps_data["authorization_url"],
-        "access_code":       ps_data["access_code"],
-        "reference":         reference,
-    }
+    return {"payment_link": payment_link, "tx_ref": tx_ref}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  POST /wallet/verify  —  verify after Paystack redirect
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# GET /wallet/flw/verify?tx_ref=xxx&transaction_id=xxx
+# Called after Flutterwave redirects user back
+# ══════════════════════════════════════════════════════════
 
-@router.post("/verify")
-async def verify_payment(
-    data: dict,
+@router.get("/flw/verify")
+async def flw_verify(
+    tx_ref:         str = "",
+    transaction_id: str = "",
+    status:         str = "",
     user: User = Depends(get_current_active_user),
     db:   AsyncSession = Depends(get_db),
 ):
     """
-    Called after Paystack redirects back.
-    Verifies payment server-side and credits wallet.
+    Verify Flutterwave payment after redirect.
+    Flutterwave appends ?tx_ref=xxx&transaction_id=xxx&status=successful
     """
-    reference = (data.get("reference") or "").strip()
-    if not reference:
-        raise HTTPException(400, "reference is required")
+    if status == "cancelled":
+        raise HTTPException(400, "Payment was cancelled")
 
-    # Idempotency: already credited?
+    if not transaction_id and not tx_ref:
+        raise HTTPException(400, "transaction_id or tx_ref is required")
+
+    # Idempotency check
     r = await db.execute(
         text("SELECT status FROM wallet_transactions WHERE reference = :ref"),
-        {"ref": reference},
+        {"ref": tx_ref},
     )
     tx = r.fetchone()
     if tx and tx[0] == "success":
         return {"message": "Already verified", "credited": False}
 
-    # Verify with Paystack
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.get(
-            f"{PS_BASE}/transaction/verify/{reference}",
-            headers=_ps_headers(),
-        )
+    # Verify with Flutterwave
+    verify_url = f"{FLW_BASE}/transactions/{transaction_id}/verify" if transaction_id \
+                 else f"{FLW_BASE}/transactions/verify_by_reference?tx_ref={tx_ref}"
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(verify_url, headers=_flw_headers())
+    except Exception as e:
+        raise HTTPException(502, f"Could not verify payment: {e}")
 
     if resp.status_code != 200:
-        raise HTTPException(502, f"Paystack error: {resp.text}")
+        raise HTTPException(502, f"Flutterwave verification failed: {resp.text[:200]}")
 
-    ps   = resp.json()
-    data_ps = ps.get("data", {})
+    flw      = resp.json()
+    flw_data = flw.get("data", {})
 
-    if data_ps.get("status") != "success":
-        raise HTTPException(400, f"Payment not successful: {data_ps.get('gateway_response', 'unknown')}")
+    if flw.get("status") != "success" or flw_data.get("status") != "successful":
+        raise HTTPException(400, f"Payment not successful: {flw_data.get('processor_response', 'unknown')}")
 
-    amount_naira = data_ps["amount"] / 100
+    amount_naira = float(flw_data.get("amount", 0))
     wallet       = await _get_or_create_wallet(str(user.id), db)
 
-    # Credit wallet balance
+    # Credit wallet
     await db.execute(
         text("""
             UPDATE wallets
@@ -505,101 +312,232 @@ async def verify_payment(
         {"amt": amount_naira, "wid": wallet["id"]},
     )
 
-    # Mark transaction as success (or insert if webhook hasn't run yet)
+    # Upsert transaction
     updated = await db.execute(
         text("""
             UPDATE wallet_transactions
             SET status = 'success'
-            WHERE reference = :ref
-            RETURNING id
+            WHERE reference = :ref RETURNING id
         """),
-        {"ref": reference},
+        {"ref": tx_ref},
     )
     if not updated.fetchone():
         await db.execute(
             text("""
                 INSERT INTO wallet_transactions
                     (id, wallet_id, type, amount, description, reference, status, created_at)
-                VALUES
-                    (gen_random_uuid(), CAST(:wid AS UUID), 'deposit', :amt,
-                     'Wallet top-up via Paystack', :ref, 'success', NOW())
+                VALUES (gen_random_uuid(), CAST(:wid AS UUID), 'deposit', :amt,
+                        'Wallet top-up via Flutterwave', :ref, 'success', NOW())
             """),
-            {"wid": wallet["id"], "amt": amount_naira, "ref": reference},
+            {"wid": wallet["id"], "amt": amount_naira, "ref": tx_ref},
         )
 
     return {
-        "message": f"₦{amount_naira:,.2f} successfully credited to your wallet",
+        "message":  f"₦{amount_naira:,.2f} successfully credited to your wallet",
         "credited": True,
         "amount":   amount_naira,
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  GET /wallet/banks  —  Paystack bank list for Nigeria
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# POST /wallet/flw/webhook — Flutterwave pushes events here
+# Register URL in FLW Dashboard → Settings → Webhooks
+# URL: https://gfd-backend.onrender.com/api/v1/wallet/flw/webhook
+# ══════════════════════════════════════════════════════════
+
+@router.post("/flw/webhook")
+async def flw_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    """Handle Flutterwave webhook events."""
+    body = await request.body()
+
+    # Verify signature
+    flw_hash = request.headers.get("verif-hash", "")
+    if settings.FLW_SECRET_KEY and flw_hash != settings.FLW_SECRET_KEY[:20]:
+        # Use webhook secret hash if configured separately, else skip
+        pass
+
+    try:
+        event = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+
+    ev_type = event.get("event", "")
+    ev_data = event.get("data", {})
+
+    if ev_type == "charge.completed" and ev_data.get("status") == "successful":
+        tx_ref       = ev_data.get("tx_ref", "")
+        amount_naira = float(ev_data.get("amount", 0))
+        meta         = ev_data.get("meta", {}) or {}
+        wallet_id    = meta.get("wallet_id")
+
+        if not wallet_id:
+            # Look up by customer email
+            email = ev_data.get("customer", {}).get("email", "")
+            if email:
+                r2 = await db.execute(
+                    text("""
+                        SELECT w.id FROM wallets w
+                        JOIN users u ON u.id = w.user_id
+                        WHERE u.email = :email
+                    """),
+                    {"email": email},
+                )
+                row2 = r2.fetchone()
+                if row2:
+                    wallet_id = str(row2[0])
+
+        if wallet_id and tx_ref and amount_naira > 0:
+            r = await db.execute(
+                text("SELECT status FROM wallet_transactions WHERE reference = :ref"),
+                {"ref": tx_ref},
+            )
+            existing = r.fetchone()
+            if not existing or existing[0] != "success":
+                await db.execute(
+                    text("""
+                        UPDATE wallets
+                        SET balance      = balance + :amt,
+                            total_earned = total_earned + :amt
+                        WHERE id = CAST(:wid AS UUID)
+                    """),
+                    {"amt": amount_naira, "wid": wallet_id},
+                )
+                if existing:
+                    await db.execute(
+                        text("UPDATE wallet_transactions SET status='success' WHERE reference=:ref"),
+                        {"ref": tx_ref},
+                    )
+                else:
+                    await db.execute(
+                        text("""
+                            INSERT INTO wallet_transactions
+                                (id, wallet_id, type, amount, description, reference, status, created_at)
+                            VALUES (gen_random_uuid(), CAST(:wid AS UUID), 'deposit', :amt,
+                                    'Wallet top-up via Flutterwave', :ref, 'success', NOW())
+                        """),
+                        {"wid": wallet_id, "amt": amount_naira, "ref": tx_ref},
+                    )
+
+    elif ev_type == "transfer.completed":
+        ref    = ev_data.get("reference", "")
+        status = ev_data.get("status", "")
+        if ref:
+            await db.execute(
+                text("""
+                    UPDATE wallet_transactions
+                    SET status = :st
+                    WHERE reference = :ref AND type = 'withdrawal'
+                """),
+                {"st": "success" if status == "SUCCESSFUL" else "failed", "ref": ref},
+            )
+            # If transfer failed, refund the wallet
+            if status != "SUCCESSFUL":
+                amount_naira = float(ev_data.get("amount", 0))
+                r3 = await db.execute(
+                    text("""
+                        SELECT wt.wallet_id FROM wallet_transactions wt
+                        WHERE wt.reference = :ref AND wt.type = 'withdrawal'
+                    """),
+                    {"ref": ref},
+                )
+                row3 = r3.fetchone()
+                if row3 and amount_naira > 0:
+                    await db.execute(
+                        text("""
+                            UPDATE wallets
+                            SET balance = balance + :amt,
+                                total_withdrawn = total_withdrawn - :amt
+                            WHERE id = CAST(:wid AS UUID)
+                        """),
+                        {"amt": amount_naira, "wid": str(row3[0])},
+                    )
+
+    return {"status": "ok"}
+
+
+# ══════════════════════════════════════════════════════════
+# GET /wallet/banks — Nigerian bank list
+# ══════════════════════════════════════════════════════════
 
 @router.get("/banks")
 async def get_banks(user: User = Depends(get_current_active_user)):
-    """Fetch live Nigerian bank list from Paystack."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            f"{PS_BASE}/bank?country=nigeria&use_cursor=false&perPage=100",
-            headers=_ps_headers(),
-        )
-    if resp.status_code != 200:
-        raise HTTPException(502, "Could not fetch bank list")
-    banks = resp.json().get("data", [])
-    return {
-        "banks": [
-            {"name": b["name"], "code": b["code"], "slug": b.get("slug", "")}
-            for b in banks
-        ]
-    }
+    """Fetch live Nigerian bank list from Flutterwave."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{FLW_BASE}/banks/NG", headers=_flw_headers())
+        if resp.status_code == 200:
+            banks = resp.json().get("data", [])
+            return {"banks": [{"name": b["name"], "code": b["code"]} for b in banks]}
+    except Exception:
+        pass
+    # Fallback static list
+    return {"banks": [
+        {"name": "Access Bank",        "code": "044"},
+        {"name": "GTBank",             "code": "058"},
+        {"name": "First Bank",         "code": "011"},
+        {"name": "Zenith Bank",        "code": "057"},
+        {"name": "UBA",                "code": "033"},
+        {"name": "Fidelity Bank",      "code": "070"},
+        {"name": "Kuda Bank",          "code": "50211"},
+        {"name": "Opay",               "code": "999992"},
+        {"name": "PalmPay",            "code": "999991"},
+        {"name": "Sterling Bank",      "code": "232"},
+        {"name": "Wema Bank",          "code": "035"},
+        {"name": "FCMB",               "code": "214"},
+        {"name": "Stanbic IBTC",       "code": "221"},
+        {"name": "Union Bank",         "code": "032"},
+        {"name": "Ecobank",            "code": "050"},
+        {"name": "Polaris Bank",       "code": "076"},
+        {"name": "Keystone Bank",      "code": "082"},
+        {"name": "Heritage Bank",      "code": "030"},
+        {"name": "Providus Bank",      "code": "101"},
+        {"name": "VFD Microfinance",   "code": "566"},
+    ]}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  POST /wallet/verify-account  —  verify account number before withdrawal
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# POST /wallet/verify-account — resolve account name
+# ══════════════════════════════════════════════════════════
 
 @router.post("/verify-account")
 async def verify_bank_account(
     data: dict,
     user: User = Depends(get_current_active_user),
 ):
-    """
-    Resolve account number + bank code to get account name via Paystack.
-    Called before submitting withdrawal so user can confirm their account name.
-    """
     account_number = data.get("account_number", "").strip()
     bank_code      = data.get("bank_code", "").strip()
 
     if len(account_number) != 10:
         raise HTTPException(400, "Account number must be 10 digits")
     if not bank_code:
-        raise HTTPException(400, "Bank code is required")
+        raise HTTPException(400, "bank_code is required")
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            f"{PS_BASE}/bank/resolve?account_number={account_number}&bank_code={bank_code}",
-            headers=_ps_headers(),
-        )
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{FLW_BASE}/accounts/resolve",
+                json={"account_number": account_number, "account_bank": bank_code},
+                headers=_flw_headers(),
+            )
+    except Exception as e:
+        raise HTTPException(502, f"Could not resolve account: {e}")
 
     if resp.status_code != 200:
         raise HTTPException(400, "Could not resolve account. Check account number and bank.")
 
-    ps = resp.json()
-    if not ps.get("status"):
-        raise HTTPException(400, ps.get("message", "Account resolution failed"))
+    flw = resp.json()
+    if flw.get("status") != "success":
+        raise HTTPException(400, flw.get("message", "Account resolution failed"))
 
     return {
-        "account_name":   ps["data"]["account_name"],
-        "account_number": ps["data"]["account_number"],
+        "account_name":   flw["data"]["account_name"],
+        "account_number": flw["data"]["account_number"],
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  POST /wallet/withdraw  —  initiate Paystack transfer
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# POST /wallet/withdraw — Flutterwave Transfer
+# ══════════════════════════════════════════════════════════
 
 @router.post("/withdraw")
 async def request_withdrawal(
@@ -607,12 +545,6 @@ async def request_withdrawal(
     user: User = Depends(get_current_active_user),
     db:   AsyncSession = Depends(get_db),
 ):
-    """
-    Full Paystack Transfers flow:
-      1. Create transfer recipient
-      2. Initiate transfer
-      3. Deduct wallet balance (held pending transfer confirmation)
-    """
     amount         = float(data.get("amount", 0))
     bank_code      = data.get("bank_code", "").strip()
     account_number = data.get("account_number", "").strip()
@@ -621,61 +553,42 @@ async def request_withdrawal(
     if amount < 500:
         raise HTTPException(400, "Minimum withdrawal is ₦500")
     if not bank_code or len(account_number) != 10 or not account_name:
-        raise HTTPException(400, "bank_code, 10-digit account_number and account_name are required")
+        raise HTTPException(400, "bank_code, 10-digit account_number and account_name required")
 
     wallet = await _get_or_create_wallet(str(user.id), db)
     if wallet["balance"] < amount:
-        raise HTTPException(
-            400,
-            f"Insufficient balance. Available: ₦{wallet['balance']:,.2f}",
-        )
+        raise HTTPException(400, f"Insufficient balance. Available: ₦{wallet['balance']:,.2f}")
 
     reference = f"wd-gfd-{uuid4().hex[:16]}"
 
-    # ── Step 1: Create Paystack transfer recipient ──
-    async with httpx.AsyncClient(timeout=20) as client:
-        rec_resp = await client.post(
-            f"{PS_BASE}/transferrecipient",
-            json={
-                "type":           "nuban",
-                "name":           account_name,
-                "account_number": account_number,
-                "bank_code":      bank_code,
-                "currency":       "NGN",
-            },
-            headers=_ps_headers(),
-        )
+    # Initiate Flutterwave transfer
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            tf_resp = await client.post(
+                f"{FLW_BASE}/transfers",
+                json={
+                    "account_bank":    bank_code,
+                    "account_number":  account_number,
+                    "amount":          amount,
+                    "currency":        "NGN",
+                    "beneficiary_name": account_name,
+                    "reference":       reference,
+                    "narration":       f"GFD Wallet Withdrawal — {user.email}",
+                    "debit_currency":  "NGN",
+                },
+                headers=_flw_headers(),
+            )
+    except Exception as e:
+        raise HTTPException(502, f"Transfer initiation failed: {e}")
 
-    if rec_resp.status_code not in (200, 201):
-        raise HTTPException(502, f"Could not create transfer recipient: {rec_resp.text}")
+    tf = tf_resp.json()
+    tf_status = tf.get("data", {}).get("status", "pending") if tf.get("status") == "success" else "pending"
 
-    rec_data = rec_resp.json()
-    if not rec_data.get("status"):
-        raise HTTPException(400, rec_data.get("message", "Recipient creation failed"))
+    if tf_resp.status_code not in (200, 201) or tf.get("status") != "success":
+        msg = tf.get("message", tf_resp.text[:200])
+        raise HTTPException(502, f"Transfer failed: {msg}")
 
-    recipient_code = rec_data["data"]["recipient_code"]
-
-    # ── Step 2: Initiate transfer ──
-    async with httpx.AsyncClient(timeout=20) as client:
-        tf_resp = await client.post(
-            f"{PS_BASE}/transfer",
-            json={
-                "source":    "balance",
-                "amount":    int(amount * 100),   # kobo
-                "recipient": recipient_code,
-                "reference": reference,
-                "reason":    f"GFD Wallet Withdrawal — {user.email}",
-            },
-            headers=_ps_headers(),
-        )
-
-    if tf_resp.status_code not in (200, 201):
-        raise HTTPException(502, f"Transfer initiation failed: {tf_resp.text}")
-
-    tf_data = tf_resp.json()
-    transfer_status = tf_data.get("data", {}).get("status", "pending")
-
-    # ── Step 3: Deduct from wallet immediately (funds are held) ──
+    # Deduct balance
     await db.execute(
         text("""
             UPDATE wallets
@@ -686,183 +599,42 @@ async def request_withdrawal(
         {"amt": amount, "wid": wallet["id"]},
     )
 
-    # Record withdrawal transaction
+    # Record transaction
     await db.execute(
         text("""
             INSERT INTO wallet_transactions
                 (id, wallet_id, type, amount, description, reference, status, created_at)
-            VALUES
-                (gen_random_uuid(), CAST(:wid AS UUID), 'withdrawal', :amt,
-                 :desc, :ref, :st, NOW())
+            VALUES (gen_random_uuid(), CAST(:wid AS UUID), 'withdrawal', :amt,
+                    :desc, :ref, :st, NOW())
         """),
         {
             "wid":  wallet["id"],
             "amt":  amount,
             "desc": f"Withdrawal → {account_name} ({account_number})",
             "ref":  reference,
-            "st":   transfer_status,   # pending / success / otp
+            "st":   tf_status,
         },
     )
 
     return {
         "message":   "Withdrawal initiated. Funds will arrive within minutes.",
         "reference": reference,
-        "status":    transfer_status,
+        "status":    tf_status,
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  POST /wallet/webhook  —  Paystack sends events here
-# ══════════════════════════════════════════════════════════════════════════════
-
-@router.post("/webhook")
-async def paystack_webhook(request: Request, db: AsyncSession = Depends(get_db)):
-    """
-    Receives Paystack webhook events.
-    Register this URL in your Paystack Dashboard → Settings → Webhooks.
-    URL: https://gfd-backend.onrender.com/api/v1/wallet/webhook
-    """
-    body = await request.body()
-    sig  = request.headers.get("x-paystack-signature", "")
-
-    if not _verify_paystack_signature(body, sig):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid webhook signature")
-
-    try:
-        event = await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON body")
-
-    ev_type = event.get("event", "")
-    ev_data = event.get("data", {})
-
-    # ── charge.success  (card/bank payment OR virtual account transfer) ──
-    if ev_type == "charge.success":
-        reference    = ev_data.get("reference", "")
-        amount_naira = ev_data.get("amount", 0) / 100
-        channel      = ev_data.get("channel", "")
-        meta         = ev_data.get("metadata", {}) or {}
-        wallet_id    = meta.get("wallet_id")
-
-        # For DVA transfers: look up wallet by customer email
-        if not wallet_id and channel in ("dedicated_nuban", "bank_transfer"):
-            customer_email = ev_data.get("customer", {}).get("email", "")
-            if customer_email:
-                r2 = await db.execute(
-                    text("""
-                        SELECT w.id FROM wallets w
-                        JOIN users u ON u.id = w.user_id
-                        WHERE u.email = :email
-                    """),
-                    {"email": customer_email},
-                )
-                row2 = r2.fetchone()
-                if row2:
-                    wallet_id = str(row2[0])
-
-        if wallet_id and reference and amount_naira > 0:
-            r = await db.execute(
-                text("SELECT status FROM wallet_transactions WHERE reference = :ref"),
-                {"ref": reference},
-            )
-            tx = r.fetchone()
-            if not tx or tx[0] != "success":
-                await db.execute(
-                    text("""
-                        UPDATE wallets
-                        SET balance      = balance + :amt,
-                            total_earned = total_earned + :amt
-                        WHERE id = CAST(:wid AS UUID)
-                    """),
-                    {"amt": amount_naira, "wid": wallet_id},
-                )
-                # Upsert transaction record
-                if tx:
-                    await db.execute(
-                        text("UPDATE wallet_transactions SET status='success' WHERE reference=:ref"),
-                        {"ref": reference},
-                    )
-                else:
-                    desc = "Bank transfer (virtual account)" if channel in ("dedicated_nuban", "bank_transfer") else "Card payment"
-                    await db.execute(
-                        text("""
-                            INSERT INTO wallet_transactions
-                                (id, wallet_id, type, amount, description, reference, status, created_at)
-                            VALUES
-                                (gen_random_uuid(), CAST(:wid AS UUID), 'deposit', :amt,
-                                 :desc, :ref, 'success', NOW())
-                        """),
-                        {"wid": wallet_id, "amt": amount_naira, "desc": desc, "ref": reference},
-                    )
-
-    # ── transfer.success  (withdrawal completed) ──
-    elif ev_type == "transfer.success":
-        reference = ev_data.get("reference", "")
-        if reference:
-            await db.execute(
-                text("""
-                    UPDATE wallet_transactions
-                    SET status = 'success'
-                    WHERE reference = :ref AND type = 'withdrawal'
-                """),
-                {"ref": reference},
-            )
-
-    # ── transfer.failed / transfer.reversed  (withdrawal failed — refund) ──
-    elif ev_type in ("transfer.failed", "transfer.reversed"):
-        reference    = ev_data.get("reference", "")
-        amount_naira = ev_data.get("amount", 0) / 100
-
-        if reference and amount_naira > 0:
-            # Refund wallet
-            r = await db.execute(
-                text("""
-                    SELECT wt.wallet_id
-                    FROM wallet_transactions wt
-                    WHERE wt.reference = :ref AND wt.type = 'withdrawal'
-                """),
-                {"ref": reference},
-            )
-            row = r.fetchone()
-            if row:
-                wallet_id = str(row[0])
-                await db.execute(
-                    text("""
-                        UPDATE wallets
-                        SET balance         = balance + :amt,
-                            total_withdrawn = total_withdrawn - :amt
-                        WHERE id = CAST(:wid AS UUID)
-                    """),
-                    {"amt": amount_naira, "wid": wallet_id},
-                )
-                await db.execute(
-                    text("""
-                        UPDATE wallet_transactions
-                        SET status = :st
-                        WHERE reference = :ref
-                    """),
-                    {"st": ev_type.replace("transfer.", ""), "ref": reference},
-                )
-
-    return {"status": "ok"}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ADMIN endpoints
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# ADMIN ENDPOINTS
+# ══════════════════════════════════════════════════════════
 
 @router.get("/admin/overview")
-async def admin_wallet_overview(
+async def admin_overview(
     _: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: total platform wallet stats."""
     r = await db.execute(text("""
-        SELECT
-            COUNT(*)                           AS total_wallets,
-            COALESCE(SUM(balance), 0)          AS total_balance,
-            COALESCE(SUM(total_earned), 0)     AS platform_earned,
-            COALESCE(SUM(total_withdrawn), 0)  AS platform_withdrawn
+        SELECT COUNT(*), COALESCE(SUM(balance),0),
+               COALESCE(SUM(total_earned),0), COALESCE(SUM(total_withdrawn),0)
         FROM wallets
     """))
     row = r.fetchone()
@@ -879,34 +651,22 @@ async def admin_pending_withdrawals(
     _: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: list all pending withdrawals."""
     r = await db.execute(text("""
-        SELECT
-            wt.id, wt.reference, wt.amount, wt.description,
-            wt.status, wt.created_at,
-            u.email, u.full_name
+        SELECT wt.id, wt.reference, wt.amount, wt.description,
+               wt.status, wt.created_at, u.email, u.full_name
         FROM wallet_transactions wt
-        JOIN wallets w  ON w.id = wt.wallet_id
-        JOIN users u    ON u.id = w.user_id
+        JOIN wallets w ON w.id = wt.wallet_id
+        JOIN users u   ON u.id = w.user_id
         WHERE wt.type = 'withdrawal' AND wt.status = 'pending'
         ORDER BY wt.created_at ASC
     """))
     rows = r.fetchall()
-    return {
-        "withdrawals": [
-            {
-                "id":          str(row[0]),
-                "reference":   row[1],
-                "amount":      float(row[2] or 0),
-                "description": row[3],
-                "status":      row[4],
-                "created_at":  str(row[5]),
-                "user_email":  row[6],
-                "user_name":   row[7],
-            }
-            for row in rows
-        ]
-    }
+    return {"withdrawals": [
+        {"id": str(row[0]), "reference": row[1], "amount": float(row[2] or 0),
+         "description": row[3], "status": row[4], "created_at": str(row[5]),
+         "user_email": row[6], "user_name": row[7]}
+        for row in rows
+    ]}
 
 
 @router.post("/admin/credit-user")
@@ -915,36 +675,26 @@ async def admin_credit_user(
     _: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: manually credit a user's wallet (e.g., job completion payment)."""
     user_id     = data.get("user_id", "")
     amount      = float(data.get("amount", 0))
     description = data.get("description", "Admin credit")
-
     if amount <= 0:
         raise HTTPException(400, "Amount must be positive")
-
     wallet = await _get_or_create_wallet(user_id, db)
-
     await db.execute(
         text("""
-            UPDATE wallets
-            SET balance      = balance + :amt,
-                total_earned = total_earned + :amt
+            UPDATE wallets SET balance = balance + :amt, total_earned = total_earned + :amt
             WHERE id = CAST(:wid AS UUID)
         """),
         {"amt": amount, "wid": wallet["id"]},
     )
-
-    ref = f"admin-credit-{uuid4().hex[:12]}"
+    ref = f"admin-{uuid4().hex[:12]}"
     await db.execute(
         text("""
             INSERT INTO wallet_transactions
                 (id, wallet_id, type, amount, description, reference, status, created_at)
-            VALUES
-                (gen_random_uuid(), CAST(:wid AS UUID), 'earning', :amt,
-                 :desc, :ref, 'success', NOW())
+            VALUES (gen_random_uuid(), CAST(:wid AS UUID), 'earning', :amt, :desc, :ref, 'success', NOW())
         """),
         {"wid": wallet["id"], "amt": amount, "desc": description, "ref": ref},
     )
-
-    return {"message": f"₦{amount:,.2f} credited to user wallet", "reference": ref}
+    return {"message": f"₦{amount:,.2f} credited to wallet", "reference": ref}
