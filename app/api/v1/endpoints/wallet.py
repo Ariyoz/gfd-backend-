@@ -347,14 +347,21 @@ async def flw_verify(
 
 @router.post("/flw/webhook")
 async def flw_webhook(request: Request, db: AsyncSession = Depends(get_db)):
-    """Handle Flutterwave webhook events."""
+    """Handle Flutterwave webhook events.
+    Register URL in FLW Dashboard → Settings → Webhooks:
+      URL:         https://gfd-backend.onrender.com/api/v1/wallet/flw/webhook
+      Secret Hash: set FLW_WEBHOOK_HASH env var to match what you put in dashboard
+    """
     body = await request.body()
 
-    # Verify signature
+    # ── Verify secret hash (prevents fake webhook calls) ──
     flw_hash = request.headers.get("verif-hash", "")
-    if settings.FLW_SECRET_KEY and flw_hash != settings.FLW_SECRET_KEY[:20]:
-        # Use webhook secret hash if configured separately, else skip
-        pass
+    if settings.FLW_WEBHOOK_HASH:
+        if flw_hash != settings.FLW_WEBHOOK_HASH:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid webhook signature"
+            )
 
     try:
         event = await request.json()

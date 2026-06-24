@@ -54,8 +54,9 @@ class Settings(BaseSettings):
     PAYSTACK_PUBLIC_KEY: str = ""
 
     # ── Flutterwave ──
-    FLW_SECRET_KEY: str = ""
-    FLW_PUBLIC_KEY: str = ""
+    FLW_SECRET_KEY:    str = ""
+    FLW_PUBLIC_KEY:    str = ""
+    FLW_WEBHOOK_HASH:  str = ""  # Set in FLW Dashboard → Settings → Webhooks → Secret Hash
 
     # ── Frontend URL (used for payment callbacks) ──
     FRONTEND_URL: str = "https://www.globalfd.xyz"
