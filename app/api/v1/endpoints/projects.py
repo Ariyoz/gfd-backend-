@@ -434,7 +434,7 @@ async def delete_project(
 # ── Admin: list all projects pending review ──
 @router.get("/admin/pending")
 async def admin_pending_projects(
-    _: User = Depends(require_client),  # reuse — actually require admin below
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
     from app.core.dependencies import require_admin

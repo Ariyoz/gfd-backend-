@@ -265,7 +265,14 @@ async def get_all_subscriptions(
     from sqlalchemy import text
     try:
         result = await db.execute(text("""
-            SELECT s.*, u.full_name, u.email, u.username, u.avatar, u.is_verified
+            SELECT
+                s.id, s.user_id, s.plan, s.billing_cycle, s.status,
+                s.payment_reference, s.started_at, s.expires_at, s.created_at,
+                u.full_name  AS full_name,
+                u.email      AS email,
+                u.username   AS username,
+                u.avatar     AS avatar,
+                u.is_verified AS is_verified
             FROM subscriptions s
             LEFT JOIN users u ON u.id = s.user_id
             WHERE s.status = :status
@@ -283,14 +290,15 @@ async def get_all_subscriptions(
             "user_id": str(row["user_id"]),
             "user_name": row["full_name"] or "Unknown",
             "user_email": row["email"] or "",
-            "username": row.get("payment_reference") or row.get("username") or "",
-            "user_avatar": row["avatar"],
-            "is_verified": row["is_verified"],
-            "plan": row["plan"],
-            "billing_cycle": row["billing_cycle"],
+            "username": row.get("username") or row.get("payment_reference") or "",
+            "user_avatar": row.get("avatar") or None,
+            "is_verified": row.get("is_verified") or False,
+            "plan": row["plan"] or "pro",
+            "billing_cycle": row.get("billing_cycle") or "monthly",
             "status": row["status"],
-            "started_at": str(row["started_at"]) if row["started_at"] else "",
-            "expires_at": str(row["expires_at"]) if row["expires_at"] else "",
+            "payment_reference": row.get("payment_reference") or "",
+            "started_at": str(row["started_at"]) if row.get("started_at") else "",
+            "expires_at": str(row["expires_at"]) if row.get("expires_at") else "",
             "created_at": str(row.get("created_at", "")),
         })
 
