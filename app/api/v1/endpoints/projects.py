@@ -101,19 +101,21 @@ async def list_projects(
         try:
             url_rows = await db.execute(sql_text("""
                 SELECT id::text,
-                       COALESCE(github_url, '') AS github_url,
-                       COALESCE(live_url, '')   AS live_url,
-                       COALESCE(cover_image, '') AS cover_image_raw
+                       COALESCE(github_url, '')      AS github_url,
+                       COALESCE(live_url, '')         AS live_url,
+                       COALESCE(repository_url, '')   AS repository_url,
+                       COALESCE(cover_image, '')      AS cover_image_raw
                 FROM projects
                 WHERE id::text = ANY(:ids)
             """), {"ids": pid_list})
-            url_map = {r[0]: (r[1], r[2], r[3]) for r in url_rows.fetchall()}
+            url_map = {r[0]: (r[1], r[2], r[3], r[4]) for r in url_rows.fetchall()}
             for p in project_data:
-                extra = url_map.get(p["id"], ("", "", ""))
-                p["github_url"] = extra[0] or p.get("repository_url") or ""
-                p["live_url"]   = extra[1] or ""
+                extra = url_map.get(p["id"], ("", "", "", ""))
+                p["github_url"]     = extra[0] or ""
+                p["live_url"]       = extra[1] or ""
+                p["repository_url"] = extra[2] or p.get("repository_url") or extra[0] or ""
                 if not p.get("cover_image"):
-                    p["cover_image"] = extra[2] or ""
+                    p["cover_image"] = extra[3] or ""
         except Exception:
             pass  # columns may not exist on older DB
 
