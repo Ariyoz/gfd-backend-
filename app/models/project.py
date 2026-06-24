@@ -56,7 +56,7 @@ class Project(BaseModel):
     view_count = Column(Integer, default=0)
     like_count = Column(Integer, default=0)
     cover_image = Column(Text, nullable=True)
-    repository_url = Column(Text, nullable=True)  # Link to project/repo
+    # repository_url is stored via raw SQL only (added via migration, not in original schema)
 
     # Relationships
     client = relationship("ClientProfile", back_populates="projects")
