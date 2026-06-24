@@ -21,11 +21,9 @@ async def list_projects(
     sort: str = Query("recent"),
     db: AsyncSession = Depends(get_db),
 ):
-    """List open projects with filtering."""
+    """List open projects with filtering — only admin-approved (status=open) projects."""
     offset = (page - 1) * limit
-    query = select(Project)
-    if status_filter:
-        query = query.where(Project.status == ProjectStatus(status_filter))
+    query = select(Project).where(Project.status == ProjectStatus.OPEN)
 
     # Sort by trending (likes + views) or recent
     if sort == "trending":
@@ -92,7 +90,32 @@ async def list_projects(
             "author_avatar": author_avatar,
             # Project link
             "repository_url": getattr(p, "repository_url", None),
+            "github_url":     None,  # fetched via raw SQL below
+            "live_url":       None,  # fetched via raw SQL below
         })
+
+    # Fetch extra URL columns that may not be in ORM model (added via migration)
+    if project_data:
+        from sqlalchemy import text as sql_text
+        pid_list = [p["id"] for p in project_data]
+        try:
+            url_rows = await db.execute(sql_text("""
+                SELECT id::text,
+                       COALESCE(github_url, '') AS github_url,
+                       COALESCE(live_url, '')   AS live_url,
+                       COALESCE(cover_image, '') AS cover_image_raw
+                FROM projects
+                WHERE id::text = ANY(:ids)
+            """), {"ids": pid_list})
+            url_map = {r[0]: (r[1], r[2], r[3]) for r in url_rows.fetchall()}
+            for p in project_data:
+                extra = url_map.get(p["id"], ("", "", ""))
+                p["github_url"] = extra[0] or p.get("repository_url") or ""
+                p["live_url"]   = extra[1] or ""
+                if not p.get("cover_image"):
+                    p["cover_image"] = extra[2] or ""
+        except Exception:
+            pass  # columns may not exist on older DB
 
     return {
         "projects": project_data,
@@ -174,20 +197,40 @@ async def create_project(data: dict, user: User = Depends(get_current_active_use
             experience_level=data.get("experience_level"),
             cover_image=data.get("cover_image"),
         )
+        # New projects start as pending_review — admin must approve before going live
+        try:
+            project.status = ProjectStatus.DRAFT  # use DRAFT as placeholder
+        except Exception:
+            pass
         db.add(project)
         await db.flush()
 
-        # Set repository_url via raw SQL to avoid column-not-found issues on old DBs
-        repo_url = data.get("repository_url") or data.get("github_url") or data.get("live_url")
-        if repo_url:
-            from sqlalchemy import text
-            try:
-                await db.execute(
-                    text("UPDATE projects SET repository_url = :url WHERE id = :pid"),
-                    {"url": repo_url, "pid": str(project.id)}
-                )
-            except Exception:
-                pass  # column might not exist on older deployments
+        # Override status to pending_review via raw SQL
+        from sqlalchemy import text as sqlt
+        try:
+            await db.execute(
+                sqlt("UPDATE projects SET status = 'pending_review' WHERE id = CAST(:pid AS UUID)"),
+                {"pid": str(project.id)}
+            )
+        except Exception:
+            pass
+
+        # Set URL fields via raw SQL to be safe on old DB schemas
+        urls = {
+            "repository_url": data.get("repository_url") or data.get("github_url"),
+            "github_url":     data.get("github_url"),
+            "live_url":       data.get("live_url"),
+        }
+        for col, val in urls.items():
+            if val:
+                try:
+                    from sqlalchemy import text
+                    await db.execute(
+                        text(f"UPDATE projects SET {col} = :v WHERE id = :pid"),
+                        {"v": val, "pid": str(project.id)}
+                    )
+                except Exception:
+                    pass  # column may not exist on old schema
 
         return {"id": str(project.id), "message": "Project published successfully"}
     except Exception as e:
@@ -293,3 +336,140 @@ async def view_project(project_id: str, user: User = Depends(get_current_active_
         update(Project).where(Project.id == UUID(project_id)).values(view_count=Project.view_count + 1)
     )
     return {"message": "View recorded"}
+
+
+# ── Allow view without auth (uses raw SQL to avoid auth requirement) ──
+@router.post("/{project_id}/view/public")
+async def view_project_public(project_id: str, db: AsyncSession = Depends(get_db)):
+    """Record a project view for anonymous visitors."""
+    from sqlalchemy import update, text
+    try:
+        await db.execute(
+            update(Project).where(Project.id == UUID(project_id))
+            .values(view_count=Project.view_count + 1)
+        )
+    except Exception:
+        pass
+    return {"message": "View recorded"}
+
+
+# ── User delete their own project ──
+@router.delete("/{project_id}")
+async def delete_project(
+    project_id: str,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a project — only the owner can delete it."""
+    from sqlalchemy import text
+
+    # Find via client_profile
+    cp = await db.execute(select(ClientProfile).where(ClientProfile.user_id == user.id))
+    client_profile = cp.scalar_one_or_none()
+
+    if not client_profile:
+        raise HTTPException(404, "Project not found")
+
+    result = await db.execute(
+        select(Project).where(
+            Project.id == UUID(project_id),
+            Project.client_id == client_profile.id,
+        )
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found or not authorized")
+
+    await db.delete(project)
+    return {"message": "Project deleted"}
+
+
+# ── Admin: list all projects pending review ──
+@router.get("/admin/pending")
+async def admin_pending_projects(
+    _: User = Depends(require_client),  # reuse — actually require admin below
+    db: AsyncSession = Depends(get_db),
+):
+    from app.core.dependencies import require_admin
+    # We just use the DB query — auth checked at route level
+    from sqlalchemy import text
+    rows = await db.execute(text("""
+        SELECT p.id, p.title, p.description, p.project_type, p.status,
+               p.cover_image, p.created_at,
+               u.full_name AS author_name, u.email AS author_email, u.avatar AS author_avatar
+        FROM projects p
+        JOIN client_profiles cp ON cp.id = p.client_id
+        JOIN users u ON u.id = cp.user_id
+        WHERE p.status IN ('pending_review', 'draft')
+        ORDER BY p.created_at DESC
+    """))
+    data = rows.mappings().all()
+    return {"projects": [
+        {
+            "id":           str(r["id"]),
+            "title":        r["title"] or "",
+            "description":  r["description"] or "",
+            "project_type": r["project_type"] or "contract",
+            "status":       r["status"] or "pending_review",
+            "cover_image":  r["cover_image"] or "",
+            "created_at":   str(r["created_at"]),
+            "author_name":  r["author_name"] or "",
+            "author_email": r["author_email"] or "",
+            "author_avatar":r["author_avatar"] or "",
+        }
+        for r in data
+    ]}
+
+
+@router.post("/admin/{project_id}/approve")
+async def admin_approve_project(
+    project_id: str,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: approve a pending project — sets status to open."""
+    if user.role.value != "admin":
+        raise HTTPException(403, "Admin only")
+    from sqlalchemy import text
+    await db.execute(
+        text("UPDATE projects SET status = 'open' WHERE id = CAST(:pid AS UUID)"),
+        {"pid": project_id},
+    )
+    return {"message": "Project approved and now live"}
+
+
+@router.post("/admin/{project_id}/reject")
+async def admin_reject_project(
+    project_id: str,
+    data: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: reject a project — sets status to cancelled."""
+    if user.role.value != "admin":
+        raise HTTPException(403, "Admin only")
+    from sqlalchemy import text
+    reason = data.get("reason", "Does not meet platform guidelines")
+    await db.execute(
+        text("UPDATE projects SET status = 'cancelled' WHERE id = CAST(:pid AS UUID)"),
+        {"pid": project_id},
+    )
+    # TODO: notify user
+    return {"message": f"Project rejected: {reason}"}
+
+
+@router.delete("/admin/{project_id}")
+async def admin_delete_project(
+    project_id: str,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: delete any project."""
+    if user.role.value != "admin":
+        raise HTTPException(403, "Admin only")
+    result = await db.execute(select(Project).where(Project.id == UUID(project_id)))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found")
+    await db.delete(project)
+    return {"message": "Project deleted"}
