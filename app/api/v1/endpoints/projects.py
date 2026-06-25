@@ -134,9 +134,9 @@ async def list_my_projects(
     db: AsyncSession = Depends(get_db),
 ):
     """List projects created by the current user."""
-    from sqlalchemy import func
+    from sqlalchemy import func, text as sql_text
 
-    # Find user's client profile
+    # Find or create client profile
     result = await db.execute(select(ClientProfile).where(ClientProfile.user_id == user.id))
     client_profile = result.scalar_one_or_none()
 
@@ -144,54 +144,50 @@ async def list_my_projects(
         return {"projects": [], "total": 0, "page": page}
 
     offset = (page - 1) * limit
-    query = select(Project).where(Project.client_id == client_profile.id).order_by(desc(Project.created_at)).offset(offset).limit(limit)
-    result = await db.execute(query)
-    projects = result.scalars().all()
 
-    count_result = await db.execute(select(func.count()).select_from(Project).where(Project.client_id == client_profile.id))
+    # Use raw SQL to get projects with all fields including URL columns
+    rows = await db.execute(sql_text("""
+        SELECT
+            p.id::text, p.title, p.description,
+            p.skills_needed, p.status::text, p.project_type::text,
+            p.deadline, p.view_count, p.like_count,
+            p.cover_image, p.created_at::text,
+            COALESCE(p.live_url, '')       AS live_url,
+            COALESCE(p.github_url, '')     AS github_url,
+            COALESCE(p.repository_url, '') AS repository_url
+        FROM projects p
+        WHERE p.client_id = :cid
+        ORDER BY p.created_at DESC
+        LIMIT :lim OFFSET :off
+    """), {"cid": str(client_profile.id), "lim": limit, "off": offset})
+
+    project_rows = rows.mappings().all()
+
+    count_result = await db.execute(sql_text(
+        "SELECT COUNT(*) FROM projects WHERE client_id = :cid"
+    ), {"cid": str(client_profile.id)})
     total = count_result.scalar() or 0
 
-    # Fetch URL columns via raw SQL (may not be in ORM model yet)
-    project_list = [{
-        "id": str(p.id),
-        "title": p.title,
-        "description": p.description,
-        "skills_needed": p.skills_needed or [],
-        "status": p.status.value if p.status else "open",
-        "project_type": p.project_type.value if p.project_type else "contract",
-        "deadline": p.deadline,
-        "view_count": p.view_count or 0,
-        "like_count": p.like_count or 0,
-        "cover_image": p.cover_image or "",
-        "created_at": str(p.created_at),
-        "live_url": "",
-        "github_url": "",
-        "repository_url": getattr(p, "repository_url", "") or "",
-    } for p in projects]
-
-    if project_list:
-        from sqlalchemy import text as sql_text
-        pid_list = [p["id"] for p in project_list]
-        try:
-            url_rows = await db.execute(sql_text("""
-                SELECT id::text,
-                       COALESCE(live_url, '')        AS live_url,
-                       COALESCE(github_url, '')      AS github_url,
-                       COALESCE(repository_url, '')  AS repository_url
-                FROM projects
-                WHERE id::text = ANY(:ids)
-            """), {"ids": pid_list})
-            url_map = {r[0]: (r[1], r[2], r[3]) for r in url_rows.fetchall()}
-            for p in project_list:
-                extra = url_map.get(p["id"], ("", "", ""))
-                p["live_url"]        = extra[0] or ""
-                p["github_url"]      = extra[1] or ""
-                p["repository_url"]  = extra[2] or p["repository_url"] or ""
-        except Exception:
-            pass  # columns may not exist on older DB
-
     return {
-        "projects": project_list,
+        "projects": [
+            {
+                "id":             r["id"],
+                "title":          r["title"] or "",
+                "description":    r["description"] or "",
+                "skills_needed":  r["skills_needed"] or [],
+                "status":         (r["status"] or "draft").lower(),
+                "project_type":   (r["project_type"] or "contract").lower(),
+                "deadline":       r["deadline"],
+                "view_count":     r["view_count"] or 0,
+                "like_count":     r["like_count"] or 0,
+                "cover_image":    r["cover_image"] or "",
+                "created_at":     r["created_at"] or "",
+                "live_url":       r["live_url"] or "",
+                "github_url":     r["github_url"] or "",
+                "repository_url": r["repository_url"] or "",
+            }
+            for r in project_rows
+        ],
         "total": total,
         "page": page,
     }
@@ -203,73 +199,69 @@ async def create_project(data: dict, user: User = Depends(get_current_active_use
     if not data.get("title"):
         raise HTTPException(status_code=400, detail="Project title is required")
 
-    # Get or create client profile for this user
+    from sqlalchemy import text
+
+    # ── Step 1: Ensure client_profile exists for this user ──
     result = await db.execute(select(ClientProfile).where(ClientProfile.user_id == user.id))
     client_profile = result.scalar_one_or_none()
-
     if not client_profile:
-        # Auto-create client profile for any user who wants to post projects
         client_profile = ClientProfile(user_id=user.id)
         db.add(client_profile)
         await db.flush()
+        print(f"[INFO] Auto-created client_profile for user {user.id}")
 
-    try:
-        # Map category string to ProjectType enum value safely
-        type_map = {
-            'webapp': ProjectType.CONTRACT, 'mobile': ProjectType.CONTRACT,
-            'api': ProjectType.CONTRACT, 'uiux': ProjectType.CONTRACT,
-            'saas': ProjectType.CONTRACT, 'opensource': ProjectType.FREELANCE,
-            'full_time': ProjectType.FULL_TIME, 'part_time': ProjectType.PART_TIME,
-            'contract': ProjectType.CONTRACT, 'freelance': ProjectType.FREELANCE,
-            'internship': ProjectType.INTERNSHIP,
-        }
-        raw_type = (data.get("project_type") or data.get("category") or "contract").lower()
-        project_type = type_map.get(raw_type, ProjectType.CONTRACT)
+    # ── Step 2: Map category to valid ProjectType ──
+    type_map = {
+        'webapp': ProjectType.CONTRACT, 'mobile': ProjectType.CONTRACT,
+        'api': ProjectType.CONTRACT, 'uiux': ProjectType.CONTRACT,
+        'saas': ProjectType.CONTRACT, 'opensource': ProjectType.FREELANCE,
+        'full_time': ProjectType.FULL_TIME, 'part_time': ProjectType.PART_TIME,
+        'contract': ProjectType.CONTRACT, 'freelance': ProjectType.FREELANCE,
+        'internship': ProjectType.INTERNSHIP,
+    }
+    raw_type = (data.get("project_type") or data.get("category") or "contract").lower()
+    project_type = type_map.get(raw_type, ProjectType.CONTRACT)
 
-        project = Project(
-            client_id=client_profile.id,
-            title=data["title"].strip(),
-            description=data.get("description", ""),
-            requirements=data.get("requirements") or data.get("description", ""),
-            skills_needed=data.get("skills_needed") or [],
-            budget_min=data.get("budget_min"),
-            budget_max=data.get("budget_max"),
-            duration=data.get("duration"),
-            experience_level=data.get("experience_level") or "mid",
-            cover_image=data.get("cover_image"),
-            project_type=project_type,
-        )
-        # Start as DRAFT — will be overridden to pending_review below
-        project.status = ProjectStatus.DRAFT
-        db.add(project)
-        await db.flush()  # write to transaction so we have the ID
+    # ── Step 3: Create the project ORM object ──
+    project = Project(
+        client_id=client_profile.id,
+        title=data["title"].strip(),
+        description=data.get("description", ""),
+        requirements=data.get("requirements") or data.get("description", ""),
+        skills_needed=data.get("skills_needed") or [],
+        budget_min=data.get("budget_min"),
+        budget_max=data.get("budget_max"),
+        duration=data.get("duration"),
+        experience_level=data.get("experience_level") or "mid",
+        cover_image=data.get("cover_image"),
+        project_type=project_type,
+        status=ProjectStatus.DRAFT,  # DRAFT = awaiting admin review
+    )
+    db.add(project)
+    await db.flush()
+    print(f"[INFO] Project created id={project.id} user={user.id} status=DRAFT")
 
-        # NOTE: status stays as DRAFT — this IS the "pending review" state.
-        # The admin query and user dashboard both handle 'draft' as pending review.
-        # We do NOT update to 'pending_review' because that value may not exist in the DB enum.
+    # ── Step 4: Set URL fields via raw SQL ──
+    url_fields = {
+        "repository_url": data.get("repository_url") or data.get("github_url"),
+        "github_url":     data.get("github_url"),
+        "live_url":       data.get("live_url"),
+    }
+    for col, val in url_fields.items():
+        if val:
+            try:
+                await db.execute(
+                    text(f"UPDATE projects SET {col} = :v WHERE id = :pid"),
+                    {"v": val, "pid": str(project.id)}
+                )
+            except Exception as url_err:
+                print(f"[WARN] Could not set {col}: {url_err}")
 
-        # Set URL fields via raw SQL (columns added via auto-migrate at startup)
-        from sqlalchemy import text
-        url_fields = {
-            "repository_url": data.get("repository_url") or data.get("github_url"),
-            "github_url":     data.get("github_url"),
-            "live_url":       data.get("live_url"),
-        }
-        for col, val in url_fields.items():
-            if val:
-                try:
-                    await db.execute(
-                        text(f"UPDATE projects SET {col} = :v WHERE id = :pid"),
-                        {"v": val, "pid": str(project.id)}
-                    )
-                except Exception as url_err:
-                    print(f"[WARN] Could not set {col}: {url_err}")
-
-        print(f"[INFO] Project created: {project.id} status=pending_review user={user.id}")
-        return {"id": str(project.id), "message": "Project submitted for review"}
-    except Exception as e:
-        print(f"[ERROR] Create project failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to publish project: {str(e)}")
+    return {
+        "id": str(project.id),
+        "status": "draft",
+        "message": "Project submitted for review. Admin will approve it shortly."
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
