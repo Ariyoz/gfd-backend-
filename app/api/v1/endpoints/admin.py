@@ -348,3 +348,127 @@ async def toggle_user_verification(user_id: str, data: dict, admin: User = Depen
     await db.execute(update(User).where(User.id == UUID(user_id)).values(is_verified=verified))
     db.add(AuditLog(admin_id=admin.id, action="verify_user" if verified else "unverify_user", target_type="user", target_id=UUID(user_id)))
     return {"message": f"User {'verified' if verified else 'unverified'}"}
+
+
+# ── Admin: Projects management (also accessible via /admin/projects) ──
+
+@router.get("/projects/pending")
+async def admin_get_pending_projects(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all projects pending admin review (draft status = awaiting approval)."""
+    from sqlalchemy import text
+    rows = await db.execute(text("""
+        SELECT p.id, p.title, p.description, p.project_type, p.status,
+               p.cover_image, p.created_at,
+               u.full_name  AS author_name,
+               u.email      AS author_email,
+               u.avatar     AS author_avatar
+        FROM projects p
+        JOIN client_profiles cp ON cp.id = p.client_id
+        JOIN users u ON u.id = cp.user_id
+        WHERE p.status IN ('draft', 'pending_review')
+        ORDER BY p.created_at DESC
+    """))
+    data = rows.mappings().all()
+    return {"projects": [
+        {
+            "id":           str(r["id"]),
+            "title":        r["title"] or "",
+            "description":  r["description"] or "",
+            "project_type": str(r["project_type"] or "contract").lower().replace("_", " "),
+            "status":       str(r["status"] or "draft"),
+            "cover_image":  r["cover_image"] or "",
+            "created_at":   str(r["created_at"]),
+            "author_name":  r["author_name"] or "",
+            "author_email": r["author_email"] or "",
+            "author_avatar":r["author_avatar"] or "",
+        }
+        for r in data
+    ]}
+
+
+@router.get("/projects/all")
+async def admin_get_all_projects(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get ALL projects regardless of status for admin review."""
+    from sqlalchemy import text
+    rows = await db.execute(text("""
+        SELECT p.id, p.title, p.description, p.project_type, p.status,
+               p.cover_image, p.created_at,
+               u.full_name  AS author_name,
+               u.email      AS author_email,
+               u.avatar     AS author_avatar
+        FROM projects p
+        JOIN client_profiles cp ON cp.id = p.client_id
+        JOIN users u ON u.id = cp.user_id
+        ORDER BY p.created_at DESC
+        LIMIT 200
+    """))
+    data = rows.mappings().all()
+    return {"projects": [
+        {
+            "id":           str(r["id"]),
+            "title":        r["title"] or "",
+            "description":  r["description"] or "",
+            "project_type": str(r["project_type"] or "contract").lower().replace("_", " "),
+            "status":       str(r["status"] or "draft"),
+            "cover_image":  r["cover_image"] or "",
+            "created_at":   str(r["created_at"]),
+            "author_name":  r["author_name"] or "",
+            "author_email": r["author_email"] or "",
+            "author_avatar":r["author_avatar"] or "",
+        }
+        for r in data
+    ]}
+
+
+@router.post("/projects/{project_id}/approve")
+async def admin_approve_project(
+    project_id: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: approve a project — sets status to open."""
+    from sqlalchemy import text
+    await db.execute(
+        text("UPDATE projects SET status = 'open' WHERE id = CAST(:pid AS UUID)"),
+        {"pid": project_id},
+    )
+    return {"message": "Project approved and now live"}
+
+
+@router.post("/projects/{project_id}/reject")
+async def admin_reject_project(
+    project_id: str,
+    data: dict,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: reject a project."""
+    from sqlalchemy import text
+    reason = data.get("reason", "Does not meet platform guidelines")
+    await db.execute(
+        text("UPDATE projects SET status = 'cancelled' WHERE id = CAST(:pid AS UUID)"),
+        {"pid": project_id},
+    )
+    return {"message": f"Project rejected: {reason}"}
+
+
+@router.delete("/projects/{project_id}")
+async def admin_remove_project(
+    project_id: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: permanently delete a project."""
+    result = await db.execute(select(Project).where(Project.id == UUID(project_id)))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found")
+    db.add(AuditLog(admin_id=admin.id, action="delete_project", target_type="project", target_id=UUID(project_id)))
+    await db.delete(project)
+    return {"message": "Project deleted"}
