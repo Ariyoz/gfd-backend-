@@ -6,7 +6,7 @@ from sqlalchemy import select, func, update
 from uuid import UUID
 
 from app.database import get_db
-from app.models import User, Post, Project, Report, UserStatus, AuditLog
+from app.models import User, Post, Project, Report, UserStatus, AuditLog, ProjectStatus
 from app.core.dependencies import require_admin
 
 router = APIRouter()
@@ -446,16 +446,24 @@ async def admin_approve_project(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: approve a project — sets status to open (visible to all users)."""
+    """Admin: approve a project — sets status to OPEN so it shows publicly."""
     from sqlalchemy import text
-    # Cast through the enum properly — PostgreSQL enum values are case-sensitive
-    # The projectstatus enum has value 'open' (lowercase) as defined in the Python enum
-    result = await db.execute(
-        text("UPDATE projects SET status = CAST('open' AS projectstatus) WHERE id = CAST(:pid AS UUID) RETURNING id"),
-        {"pid": project_id},
-    )
-    if not result.fetchone():
-        raise HTTPException(404, "Project not found")
+    # Try both lowercase and uppercase enum label to handle either DB schema
+    try:
+        result = await db.execute(
+            text("UPDATE projects SET status = 'OPEN'::projectstatus WHERE id = :pid RETURNING id"),
+            {"pid": project_id},
+        )
+        if not result.fetchone():
+            raise HTTPException(404, "Project not found")
+    except Exception:
+        # Fallback: use ORM to update status
+        proj = await db.execute(select(Project).where(Project.id == UUID(project_id)))
+        p = proj.scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, "Project not found")
+        p.status = ProjectStatus.OPEN
+        await db.flush()
     return {"message": "Project approved and now live"}
 
 
@@ -466,13 +474,21 @@ async def admin_reject_project(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: reject a project."""
+    """Admin: reject/decline a project."""
     from sqlalchemy import text
     reason = data.get("reason", "Does not meet platform guidelines")
-    await db.execute(
-        text("UPDATE projects SET status = CAST('cancelled' AS projectstatus) WHERE id = CAST(:pid AS UUID)"),
-        {"pid": project_id},
-    )
+    try:
+        await db.execute(
+            text("UPDATE projects SET status = 'CANCELLED'::projectstatus WHERE id = :pid"),
+            {"pid": project_id},
+        )
+    except Exception:
+        proj = await db.execute(select(Project).where(Project.id == UUID(project_id)))
+        p = proj.scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, "Project not found")
+        p.status = ProjectStatus.CANCELLED
+        await db.flush()
     return {"message": f"Project declined: {reason}"}
 
 
