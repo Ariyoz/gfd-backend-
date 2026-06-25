@@ -11,35 +11,45 @@ logger = logging.getLogger("gfd.middleware")
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Add comprehensive security headers to all responses."""
+    """Add security headers to all responses."""
 
     async def dispatch(self, request: Request, call_next):
-        # Let preflight OPTIONS pass straight through — CORS middleware handles it
         if request.method == "OPTIONS":
             return await call_next(request)
 
         response = await call_next(request)
-        # Prevent MIME sniffing
+
+        # ── Security headers ──
         response.headers["X-Content-Type-Options"] = "nosniff"
-        # Prevent clickjacking
-        response.headers["X-Frame-Options"] = "DENY"
-        # XSS protection
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        # Force HTTPS
         response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
-        # Control referrer info
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        # Restrict browser features (allow camera/mic for calls)
-        response.headers["Permissions-Policy"] = "geolocation=(), payment=()"
-        # Content Security Policy - permissive for API
-        if not request.url.path.startswith('/api/'):
-            response.headers["Content-Security-Policy"] = "default-src 'self' https:; script-src 'self' 'unsafe-inline' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https: blob:; connect-src 'self' https: wss:; font-src 'self' https: data:; media-src 'self' https: blob:;"
-        # Prevent caching of sensitive data
-        if '/auth/' in request.url.path or '/admin/' in request.url.path:
-            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
-            response.headers["Pragma"] = "no-cache"
-        # Cross-Origin policies — allow cross-origin fetches from our frontend
+        response.headers["Permissions-Policy"] = "geolocation=(), payment=(), camera=(), microphone=(self)"
         response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+
+        # Use CSP frame-ancestors instead of X-Frame-Options (modern equivalent)
+        response.headers["Content-Security-Policy"] = (
+            "frame-ancestors 'none'; "
+            "default-src 'self' https:; "
+            "script-src 'self' 'unsafe-inline' https:; "
+            "style-src 'self' 'unsafe-inline' https:; "
+            "img-src 'self' data: https: blob:; "
+            "connect-src 'self' https: wss:; "
+            "font-src 'self' https: data:; "
+            "media-src 'self' https: blob:;"
+        )
+
+        # Add cache headers to API responses (short TTL, revalidate)
+        if request.url.path.startswith('/api/'):
+            if '/auth/' in request.url.path or '/admin/' in request.url.path:
+                response.headers["Cache-Control"] = "no-store, private"
+            elif request.method == "GET":
+                response.headers["Cache-Control"] = "public, max-age=10, stale-while-revalidate=60"
+
+        # Ensure JSON responses include charset
+        ct = response.headers.get("content-type", "")
+        if "application/json" in ct and "charset" not in ct:
+            response.headers["content-type"] = "application/json; charset=utf-8"
+
         return response
 
 
