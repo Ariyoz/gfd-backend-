@@ -399,6 +399,9 @@ async def admin_get_all_projects(
     rows = await db.execute(text("""
         SELECT p.id, p.title, p.description, p.project_type, p.status,
                p.cover_image, p.created_at,
+               COALESCE(p.live_url, '')        AS live_url,
+               COALESCE(p.github_url, '')      AS github_url,
+               COALESCE(p.repository_url, '')  AS repository_url,
                u.full_name  AS author_name,
                u.email      AS author_email,
                u.avatar     AS author_avatar
@@ -411,16 +414,19 @@ async def admin_get_all_projects(
     data = rows.mappings().all()
     return {"projects": [
         {
-            "id":           str(r["id"]),
-            "title":        r["title"] or "",
-            "description":  r["description"] or "",
-            "project_type": str(r["project_type"] or "contract").lower().replace("_", " "),
-            "status":       str(r["status"] or "draft"),
-            "cover_image":  r["cover_image"] or "",
-            "created_at":   str(r["created_at"]),
-            "author_name":  r["author_name"] or "",
-            "author_email": r["author_email"] or "",
-            "author_avatar":r["author_avatar"] or "",
+            "id":              str(r["id"]),
+            "title":           r["title"] or "",
+            "description":     r["description"] or "",
+            "project_type":    str(r["project_type"] or "contract").lower().replace("_", " "),
+            "status":          str(r["status"] or "draft").lower(),
+            "cover_image":     r["cover_image"] or "",
+            "created_at":      str(r["created_at"]),
+            "live_url":        r["live_url"] or "",
+            "github_url":      r["github_url"] or "",
+            "repository_url":  r["repository_url"] or "",
+            "author_name":     r["author_name"] or "",
+            "author_email":    r["author_email"] or "",
+            "author_avatar":   r["author_avatar"] or "",
         }
         for r in data
     ]}
