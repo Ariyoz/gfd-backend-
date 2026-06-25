@@ -267,178 +267,20 @@ async def create_project(data: dict, user: User = Depends(get_current_active_use
         raise HTTPException(status_code=500, detail=f"Failed to publish project: {str(e)}")
 
 
-@router.get("/{project_id}")
-async def get_project(project_id: str, db: AsyncSession = Depends(get_db)):
-    """Get project details."""
-    result = await db.execute(select(Project).where(Project.id == UUID(project_id)))
-    project = result.scalar_one_or_none()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return project
+# ══════════════════════════════════════════════════════════════════
+# IMPORTANT: All /admin/* and named sub-routes MUST come BEFORE
+# /{project_id} — FastAPI matches top-to-bottom and "admin" would
+# otherwise be captured as a project_id UUID causing 404s.
+# ══════════════════════════════════════════════════════════════════
 
-
-@router.post("/{project_id}/apply", status_code=status.HTTP_201_CREATED)
-async def apply_to_project(project_id: str, data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Apply to a project (developer)."""
-    from app.models import DeveloperProfile
-    dev_result = await db.execute(select(DeveloperProfile).where(DeveloperProfile.user_id == user.id))
-    dev_profile = dev_result.scalar_one_or_none()
-    if not dev_profile:
-        raise HTTPException(status_code=400, detail="Developer profile required")
-
-    application = Application(
-        project_id=UUID(project_id),
-        developer_id=dev_profile.id,
-        cover_letter=data.get("cover_letter"),
-        proposal=data.get("proposal"),
-        proposed_rate=data.get("proposed_rate"),
-    )
-    db.add(application)
-    await db.flush()
-    return {"id": str(application.id), "message": "Application submitted"}
-
-
-@router.patch("/{project_id}/applications/{app_id}")
-async def update_application_status(
-    project_id: str, app_id: str, data: dict,
-    user: User = Depends(require_client), db: AsyncSession = Depends(get_db),
-):
-    """Accept/reject application (client only)."""
-    result = await db.execute(select(Application).where(Application.id == UUID(app_id)))
-    application = result.scalar_one_or_none()
-    if not application:
-        raise HTTPException(status_code=404, detail="Application not found")
-    application.status = ApplicationStatus(data["status"])
-    return {"message": f"Application {data['status']}"}
-
-
-@router.post("/{project_id}/like")
-async def like_project(project_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Toggle like on a project — one like per user, can unlike."""
-    from sqlalchemy import update, text
-
-    try:
-        UUID(project_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid project ID")
-
-    # Verify project exists
-    proj_check = await db.execute(text(
-        "SELECT id FROM projects WHERE id = CAST(:pid AS UUID)"
-    ), {"pid": project_id})
-    if not proj_check.fetchone():
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    # Check if user already liked this project
-    check = await db.execute(text(
-        "SELECT id FROM project_likes WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)"
-    ), {"pid": project_id, "uid": str(user.id)})
-    existing = check.fetchone()
-
-    if existing:
-        # Unlike — remove the like
-        await db.execute(text(
-            "DELETE FROM project_likes WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)"
-        ), {"pid": project_id, "uid": str(user.id)})
-        await db.execute(
-            update(Project).where(Project.id == UUID(project_id))
-            .values(like_count=Project.like_count - 1)
-        )
-        return {"message": "Project unliked", "liked": False}
-    else:
-        # Like — add the like
-        await db.execute(text(
-            "INSERT INTO project_likes (project_id, user_id) VALUES (CAST(:pid AS UUID), CAST(:uid AS UUID)) ON CONFLICT DO NOTHING"
-        ), {"pid": project_id, "uid": str(user.id)})
-        await db.execute(
-            update(Project).where(Project.id == UUID(project_id))
-            .values(like_count=Project.like_count + 1)
-        )
-        return {"message": "Project liked", "liked": True}
-
-
-@router.post("/{project_id}/view")
-async def view_project(project_id: str, db: AsyncSession = Depends(get_db), request: Request = None):
-    """Record a project view — works with or without auth. One view per user (auth) or just increments (anon)."""
-    from fastapi import Request as FastAPIRequest
-    from sqlalchemy import update, text
-
-    # Try to get user from auth header if present — but don't require it
-    auth_user_id = None
-    try:
-        from fastapi.security import HTTPBearer
-        from app.core.security import decode_token
-        if request:
-            auth_header = request.headers.get("Authorization", "")
-            if auth_header.startswith("Bearer "):
-                token = auth_header.split(" ", 1)[1]
-                payload = decode_token(token)
-                if payload:
-                    auth_user_id = payload.get("sub")
-    except Exception:
-        pass
-
-    if auth_user_id:
-        # Authenticated — one view per user
-        check = await db.execute(text(
-            "SELECT id FROM project_views WHERE project_id = :pid AND user_id = :uid"
-        ), {"pid": project_id, "uid": auth_user_id})
-        if check.fetchone():
-            return {"message": "Already viewed"}
-        await db.execute(text(
-            "INSERT INTO project_views (project_id, user_id) VALUES (:pid, :uid)"
-        ), {"pid": project_id, "uid": auth_user_id})
-
-    # Always increment view count (for anon visitors too)
-    try:
-        await db.execute(
-            update(Project).where(Project.id == UUID(project_id))
-            .values(view_count=Project.view_count + 1)
-        )
-    except Exception:
-        pass
-    return {"message": "View recorded"}
-
-
-# ── User delete their own project ──
-@router.delete("/{project_id}")
-async def delete_project(
-    project_id: str,
-    user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Delete a project — only the owner can delete it."""
-    from sqlalchemy import text
-
-    # Find via client_profile
-    cp = await db.execute(select(ClientProfile).where(ClientProfile.user_id == user.id))
-    client_profile = cp.scalar_one_or_none()
-
-    if not client_profile:
-        raise HTTPException(404, "Project not found")
-
-    result = await db.execute(
-        select(Project).where(
-            Project.id == UUID(project_id),
-            Project.client_id == client_profile.id,
-        )
-    )
-    project = result.scalar_one_or_none()
-    if not project:
-        raise HTTPException(404, "Project not found or not authorized")
-
-    await db.delete(project)
-    return {"message": "Project deleted"}
-
-
-# ── Admin: list all projects pending review ──
 @router.get("/admin/pending")
 async def admin_pending_projects(
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from app.core.dependencies import require_admin
-    # We just use the DB query — auth checked at route level
+    """Admin: list all projects pending review."""
+    if user.role.value != "admin":
+        raise HTTPException(403, "Admin only")
     from sqlalchemy import text
     rows = await db.execute(text("""
         SELECT p.id, p.title, p.description, p.project_type, p.status,
@@ -474,7 +316,7 @@ async def admin_approve_project(
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: approve a pending project — sets status to open."""
+    """Admin: approve a pending project."""
     if user.role.value != "admin":
         raise HTTPException(403, "Admin only")
     from sqlalchemy import text
@@ -492,7 +334,7 @@ async def admin_reject_project(
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: reject a project — sets status to cancelled."""
+    """Admin: reject a project."""
     if user.role.value != "admin":
         raise HTTPException(403, "Admin only")
     from sqlalchemy import text
@@ -501,7 +343,6 @@ async def admin_reject_project(
         text("UPDATE projects SET status = 'cancelled' WHERE id = CAST(:pid AS UUID)"),
         {"pid": project_id},
     )
-    # TODO: notify user
     return {"message": f"Project rejected: {reason}"}
 
 
@@ -520,3 +361,132 @@ async def admin_delete_project(
         raise HTTPException(404, "Project not found")
     await db.delete(project)
     return {"message": "Project deleted"}
+
+
+# ── Named sub-routes before wildcard /{project_id} ──
+
+@router.post("/{project_id}/apply", status_code=status.HTTP_201_CREATED)
+async def apply_to_project(project_id: str, data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Apply to a project (developer)."""
+    from app.models import DeveloperProfile
+    dev_result = await db.execute(select(DeveloperProfile).where(DeveloperProfile.user_id == user.id))
+    dev_profile = dev_result.scalar_one_or_none()
+    if not dev_profile:
+        raise HTTPException(status_code=400, detail="Developer profile required")
+    application = Application(
+        project_id=UUID(project_id),
+        developer_id=dev_profile.id,
+        cover_letter=data.get("cover_letter"),
+        proposal=data.get("proposal"),
+        proposed_rate=data.get("proposed_rate"),
+    )
+    db.add(application)
+    await db.flush()
+    return {"id": str(application.id), "message": "Application submitted"}
+
+
+@router.patch("/{project_id}/applications/{app_id}")
+async def update_application_status(
+    project_id: str, app_id: str, data: dict,
+    user: User = Depends(require_client), db: AsyncSession = Depends(get_db),
+):
+    """Accept/reject application (client only)."""
+    result = await db.execute(select(Application).where(Application.id == UUID(app_id)))
+    application = result.scalar_one_or_none()
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found")
+    application.status = ApplicationStatus(data["status"])
+    return {"message": f"Application {data['status']}"}
+
+
+@router.post("/{project_id}/like")
+async def like_project(project_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Toggle like on a project."""
+    from sqlalchemy import update, text
+    try:
+        UUID(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+    proj_check = await db.execute(text(
+        "SELECT id FROM projects WHERE id = CAST(:pid AS UUID)"
+    ), {"pid": project_id})
+    if not proj_check.fetchone():
+        raise HTTPException(status_code=404, detail="Project not found")
+    check = await db.execute(text(
+        "SELECT id FROM project_likes WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)"
+    ), {"pid": project_id, "uid": str(user.id)})
+    if check.fetchone():
+        await db.execute(text(
+            "DELETE FROM project_likes WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)"
+        ), {"pid": project_id, "uid": str(user.id)})
+        await db.execute(update(Project).where(Project.id == UUID(project_id)).values(like_count=Project.like_count - 1))
+        return {"message": "Project unliked", "liked": False}
+    else:
+        await db.execute(text(
+            "INSERT INTO project_likes (project_id, user_id) VALUES (CAST(:pid AS UUID), CAST(:uid AS UUID)) ON CONFLICT DO NOTHING"
+        ), {"pid": project_id, "uid": str(user.id)})
+        await db.execute(update(Project).where(Project.id == UUID(project_id)).values(like_count=Project.like_count + 1))
+        return {"message": "Project liked", "liked": True}
+
+
+@router.post("/{project_id}/view")
+async def view_project(project_id: str, db: AsyncSession = Depends(get_db), request: Request = None):
+    """Record a project view — works with or without auth."""
+    from sqlalchemy import update, text
+    auth_user_id = None
+    try:
+        from app.core.security import decode_token
+        if request:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                payload = decode_token(auth_header.split(" ", 1)[1])
+                if payload:
+                    auth_user_id = payload.get("sub")
+    except Exception:
+        pass
+    if auth_user_id:
+        check = await db.execute(text(
+            "SELECT id FROM project_views WHERE project_id = :pid AND user_id = :uid"
+        ), {"pid": project_id, "uid": auth_user_id})
+        if check.fetchone():
+            return {"message": "Already viewed"}
+        await db.execute(text(
+            "INSERT INTO project_views (project_id, user_id) VALUES (:pid, :uid)"
+        ), {"pid": project_id, "uid": auth_user_id})
+    try:
+        await db.execute(update(Project).where(Project.id == UUID(project_id)).values(view_count=Project.view_count + 1))
+    except Exception:
+        pass
+    return {"message": "View recorded"}
+
+
+@router.delete("/{project_id}")
+async def delete_project(
+    project_id: str,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a project — owner only."""
+    cp = await db.execute(select(ClientProfile).where(ClientProfile.user_id == user.id))
+    client_profile = cp.scalar_one_or_none()
+    if not client_profile:
+        raise HTTPException(404, "Project not found")
+    result = await db.execute(
+        select(Project).where(Project.id == UUID(project_id), Project.client_id == client_profile.id)
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found or not authorized")
+    await db.delete(project)
+    return {"message": "Project deleted"}
+
+
+# ── Wildcard LAST — catches any /{project_id} ──
+@router.get("/{project_id}")
+async def get_project(project_id: str, db: AsyncSession = Depends(get_db)):
+    """Get project details."""
+    result = await db.execute(select(Project).where(Project.id == UUID(project_id)))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
