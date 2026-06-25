@@ -244,12 +244,9 @@ async def create_project(data: dict, user: User = Depends(get_current_active_use
         db.add(project)
         await db.flush()  # write to transaction so we have the ID
 
-        # Set status to pending_review via raw SQL (enum value added at startup)
-        from sqlalchemy import text as sqlt
-        await db.execute(
-            sqlt("UPDATE projects SET status = 'pending_review' WHERE id = :pid"),
-            {"pid": str(project.id)}
-        )
+        # NOTE: status stays as DRAFT — this IS the "pending review" state.
+        # The admin query and user dashboard both handle 'draft' as pending review.
+        # We do NOT update to 'pending_review' because that value may not exist in the DB enum.
 
         # Set URL fields via raw SQL (columns added via auto-migrate at startup)
         from sqlalchemy import text

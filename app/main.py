@@ -151,18 +151,6 @@ async def lifespan(app: FastAPI):
                 CREATE INDEX IF NOT EXISTS idx_wt_wallet ON wallet_transactions(wallet_id);
                 CREATE INDEX IF NOT EXISTS idx_wt_reference ON wallet_transactions(reference);
                 CREATE INDEX IF NOT EXISTS idx_va_user ON virtual_accounts(user_id);
-            """))        # Add pending_review to the projectstatus enum if not exists (safe, idempotent)
-            await conn.execute(text("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_enum
-                        WHERE enumlabel = 'pending_review'
-                        AND enumtypid = (SELECT oid FROM pg_type WHERE typname = 'projectstatus')
-                    ) THEN
-                        ALTER TYPE projectstatus ADD VALUE 'pending_review';
-                    END IF;
-                END $$;
             """))
             await conn.execute(text("""
                 DO $$
