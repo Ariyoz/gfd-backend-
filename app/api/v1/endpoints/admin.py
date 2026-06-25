@@ -396,12 +396,10 @@ async def admin_get_all_projects(
 ):
     """Get ALL projects regardless of status for admin review."""
     from sqlalchemy import text
+    # Use a two-step query: first get projects + authors, then get URL fields separately
     rows = await db.execute(text("""
-        SELECT p.id, p.title, p.description, p.project_type, p.status,
-               p.cover_image, p.created_at,
-               COALESCE(p.live_url, '')        AS live_url,
-               COALESCE(p.github_url, '')      AS github_url,
-               COALESCE(p.repository_url, '')  AS repository_url,
+        SELECT p.id::text, p.title, p.description, p.project_type::text, p.status::text,
+               p.cover_image, p.created_at::text,
                u.full_name  AS author_name,
                u.email      AS author_email,
                u.avatar     AS author_avatar
@@ -411,25 +409,35 @@ async def admin_get_all_projects(
         ORDER BY p.created_at DESC
         LIMIT 200
     """))
-    data = rows.mappings().all()
-    return {"projects": [
-        {
-            "id":              str(r["id"]),
-            "title":           r["title"] or "",
-            "description":     r["description"] or "",
-            "project_type":    str(r["project_type"] or "contract").lower().replace("_", " "),
-            "status":          str(r["status"] or "draft").lower(),
-            "cover_image":     r["cover_image"] or "",
-            "created_at":      str(r["created_at"]),
-            "live_url":        r["live_url"] or "",
-            "github_url":      r["github_url"] or "",
-            "repository_url":  r["repository_url"] or "",
-            "author_name":     r["author_name"] or "",
-            "author_email":    r["author_email"] or "",
-            "author_avatar":   r["author_avatar"] or "",
-        }
-        for r in data
-    ]}
+    projects = [dict(r) for r in rows.mappings().all()]
+
+    if projects:
+        ids = [p["id"] for p in projects]
+        try:
+            url_rows = await db.execute(text("""
+                SELECT id::text,
+                       COALESCE(live_url, '')       AS live_url,
+                       COALESCE(github_url, '')     AS github_url,
+                       COALESCE(repository_url, '') AS repository_url
+                FROM projects WHERE id::text = ANY(:ids)
+            """), {"ids": ids})
+            url_map = {r[0]: (r[1], r[2], r[3]) for r in url_rows.fetchall()}
+        except Exception:
+            url_map = {}
+
+        for p in projects:
+            u = url_map.get(p["id"], ("", "", ""))
+            p["live_url"]       = u[0] or ""
+            p["github_url"]     = u[1] or ""
+            p["repository_url"] = u[2] or ""
+            p["status"]         = (p.get("status") or "draft").lower()
+            p["project_type"]   = (p.get("project_type") or "contract").lower().replace("_", " ")
+            p["cover_image"]    = p.get("cover_image") or ""
+            p["author_name"]    = p.get("author_name") or ""
+            p["author_email"]   = p.get("author_email") or ""
+            p["author_avatar"]  = p.get("author_avatar") or ""
+
+    return {"projects": projects}
 
 
 @router.post("/projects/{project_id}/approve")
@@ -438,12 +446,16 @@ async def admin_approve_project(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: approve a project — sets status to open."""
+    """Admin: approve a project — sets status to open (visible to all users)."""
     from sqlalchemy import text
-    await db.execute(
-        text("UPDATE projects SET status = 'open' WHERE id = CAST(:pid AS UUID)"),
+    # Cast through the enum properly — PostgreSQL enum values are case-sensitive
+    # The projectstatus enum has value 'open' (lowercase) as defined in the Python enum
+    result = await db.execute(
+        text("UPDATE projects SET status = CAST('open' AS projectstatus) WHERE id = CAST(:pid AS UUID) RETURNING id"),
         {"pid": project_id},
     )
+    if not result.fetchone():
+        raise HTTPException(404, "Project not found")
     return {"message": "Project approved and now live"}
 
 
@@ -458,10 +470,10 @@ async def admin_reject_project(
     from sqlalchemy import text
     reason = data.get("reason", "Does not meet platform guidelines")
     await db.execute(
-        text("UPDATE projects SET status = 'cancelled' WHERE id = CAST(:pid AS UUID)"),
+        text("UPDATE projects SET status = CAST('cancelled' AS projectstatus) WHERE id = CAST(:pid AS UUID)"),
         {"pid": project_id},
     )
-    return {"message": f"Project rejected: {reason}"}
+    return {"message": f"Project declined: {reason}"}
 
 
 @router.delete("/projects/{project_id}")

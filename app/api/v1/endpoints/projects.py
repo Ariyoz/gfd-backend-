@@ -326,7 +326,7 @@ async def admin_approve_project(
         raise HTTPException(403, "Admin only")
     from sqlalchemy import text
     await db.execute(
-        text("UPDATE projects SET status = 'open' WHERE id = CAST(:pid AS UUID)"),
+        text("UPDATE projects SET status = CAST('open' AS projectstatus) WHERE id = CAST(:pid AS UUID)"),
         {"pid": project_id},
     )
     return {"message": "Project approved and now live"}
@@ -345,7 +345,7 @@ async def admin_reject_project(
     from sqlalchemy import text
     reason = data.get("reason", "Does not meet platform guidelines")
     await db.execute(
-        text("UPDATE projects SET status = 'cancelled' WHERE id = CAST(:pid AS UUID)"),
+        text("UPDATE projects SET status = CAST('cancelled' AS projectstatus) WHERE id = CAST(:pid AS UUID)"),
         {"pid": project_id},
     )
     return {"message": f"Project rejected: {reason}"}
