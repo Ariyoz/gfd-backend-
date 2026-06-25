@@ -235,11 +235,11 @@ async def create_project(data: dict, user: User = Depends(get_current_active_use
         experience_level=data.get("experience_level") or "mid",
         cover_image=data.get("cover_image"),
         project_type=project_type,
-        status=ProjectStatus.DRAFT,  # DRAFT = awaiting admin review
+        status=ProjectStatus.OPEN,  # Go live immediately — no admin approval needed
     )
     db.add(project)
     await db.flush()
-    print(f"[INFO] Project created id={project.id} user={user.id} status=DRAFT")
+    print(f"[INFO] Project created id={project.id} user={user.id} status=OPEN")
 
     # ── Step 4: Set URL fields via raw SQL ──
     url_fields = {
@@ -259,8 +259,8 @@ async def create_project(data: dict, user: User = Depends(get_current_active_use
 
     return {
         "id": str(project.id),
-        "status": "draft",
-        "message": "Project submitted for review. Admin will approve it shortly."
+        "status": "open",
+        "message": "Project published successfully! It is now live."
     }
 
 
