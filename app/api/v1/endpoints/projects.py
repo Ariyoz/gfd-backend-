@@ -6,7 +6,7 @@ from sqlalchemy import select, desc
 from uuid import UUID
 
 from app.database import get_db
-from app.models import Project, Application, User, ClientProfile, ProjectStatus, ApplicationStatus, UserRole
+from app.models import Project, Application, User, ClientProfile, ProjectStatus, ProjectType, ApplicationStatus, UserRole
 from app.core.dependencies import get_current_active_user, require_client
 
 router = APIRouter()
@@ -214,54 +214,62 @@ async def create_project(data: dict, user: User = Depends(get_current_active_use
         await db.flush()
 
     try:
+        # Map category string to ProjectType enum value safely
+        type_map = {
+            'webapp': ProjectType.CONTRACT, 'mobile': ProjectType.CONTRACT,
+            'api': ProjectType.CONTRACT, 'uiux': ProjectType.CONTRACT,
+            'saas': ProjectType.CONTRACT, 'opensource': ProjectType.FREELANCE,
+            'full_time': ProjectType.FULL_TIME, 'part_time': ProjectType.PART_TIME,
+            'contract': ProjectType.CONTRACT, 'freelance': ProjectType.FREELANCE,
+            'internship': ProjectType.INTERNSHIP,
+        }
+        raw_type = (data.get("project_type") or data.get("category") or "contract").lower()
+        project_type = type_map.get(raw_type, ProjectType.CONTRACT)
+
         project = Project(
             client_id=client_profile.id,
             title=data["title"].strip(),
             description=data.get("description", ""),
-            requirements=data.get("requirements"),
+            requirements=data.get("requirements") or data.get("description", ""),
             skills_needed=data.get("skills_needed") or [],
             budget_min=data.get("budget_min"),
             budget_max=data.get("budget_max"),
             duration=data.get("duration"),
-            experience_level=data.get("experience_level"),
+            experience_level=data.get("experience_level") or "mid",
             cover_image=data.get("cover_image"),
+            project_type=project_type,
         )
-        # New projects start as pending_review — admin must approve before going live
-        try:
-            project.status = ProjectStatus.DRAFT  # use DRAFT as placeholder
-        except Exception:
-            pass
+        # Start as DRAFT — will be overridden to pending_review below
+        project.status = ProjectStatus.DRAFT
         db.add(project)
-        await db.flush()
+        await db.flush()  # write to transaction so we have the ID
 
-        # Override status to pending_review via raw SQL
+        # Set status to pending_review via raw SQL (enum value added at startup)
         from sqlalchemy import text as sqlt
-        try:
-            await db.execute(
-                sqlt("UPDATE projects SET status = 'pending_review' WHERE id = CAST(:pid AS UUID)"),
-                {"pid": str(project.id)}
-            )
-        except Exception:
-            pass
+        await db.execute(
+            sqlt("UPDATE projects SET status = 'pending_review' WHERE id = :pid"),
+            {"pid": str(project.id)}
+        )
 
-        # Set URL fields via raw SQL to be safe on old DB schemas
-        urls = {
+        # Set URL fields via raw SQL (columns added via auto-migrate at startup)
+        from sqlalchemy import text
+        url_fields = {
             "repository_url": data.get("repository_url") or data.get("github_url"),
             "github_url":     data.get("github_url"),
             "live_url":       data.get("live_url"),
         }
-        for col, val in urls.items():
+        for col, val in url_fields.items():
             if val:
                 try:
-                    from sqlalchemy import text
                     await db.execute(
                         text(f"UPDATE projects SET {col} = :v WHERE id = :pid"),
                         {"v": val, "pid": str(project.id)}
                     )
-                except Exception:
-                    pass  # column may not exist on old schema
+                except Exception as url_err:
+                    print(f"[WARN] Could not set {col}: {url_err}")
 
-        return {"id": str(project.id), "message": "Project published successfully"}
+        print(f"[INFO] Project created: {project.id} status=pending_review user={user.id}")
+        return {"id": str(project.id), "message": "Project submitted for review"}
     except Exception as e:
         print(f"[ERROR] Create project failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to publish project: {str(e)}")
