@@ -38,12 +38,21 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "media-src 'self' https: blob:;"
         )
 
-        # Add cache headers to API responses (short TTL, revalidate)
+        # Add cache headers to API responses
         if request.url.path.startswith('/api/'):
             if '/auth/' in request.url.path or '/admin/' in request.url.path:
+                # Auth and admin: never cache
                 response.headers["Cache-Control"] = "no-store, private"
             elif request.method == "GET":
-                response.headers["Cache-Control"] = "public, max-age=10, stale-while-revalidate=60"
+                path = request.url.path
+                # Public read-heavy endpoints: cache aggressively
+                if any(p in path for p in ['/projects', '/explore', '/jobs']):
+                    response.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=120"
+                elif '/feed' in path or '/notifications' in path:
+                    # Feed and notifications: very short cache
+                    response.headers["Cache-Control"] = "private, max-age=5, stale-while-revalidate=30"
+                else:
+                    response.headers["Cache-Control"] = "public, max-age=10, stale-while-revalidate=60"
 
         # Ensure JSON responses include charset
         ct = response.headers.get("content-type", "")
