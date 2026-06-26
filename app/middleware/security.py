@@ -19,42 +19,42 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
         response = await call_next(request)
 
-        # ── Security headers ──
+        # ── Core security headers ──
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "geolocation=(), payment=(), camera=(), microphone=(self)"
+        response.headers["Permissions-Policy"] = "geolocation=(), payment=(), camera=(self), microphone=(self)"
         response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
 
-        # Use CSP frame-ancestors instead of X-Frame-Options (modern equivalent)
+        # ── CSP — frame-ancestors replaces X-Frame-Options ──
         response.headers["Content-Security-Policy"] = (
             "frame-ancestors 'none'; "
             "default-src 'self' https:; "
             "script-src 'self' 'unsafe-inline' https:; "
             "style-src 'self' 'unsafe-inline' https:; "
             "img-src 'self' data: https: blob:; "
-            "connect-src 'self' https: wss:; "
+            "connect-src 'self' https: wss: ws:; "
             "font-src 'self' https: data:; "
-            "media-src 'self' https: blob:;"
+            "media-src 'self' https: blob:; "
+            "object-src 'none'; "
+            "base-uri 'self';"
         )
 
-        # Add cache headers to API responses
+        # ── Cache headers ──
         if request.url.path.startswith('/api/'):
             if '/auth/' in request.url.path or '/admin/' in request.url.path:
-                # Auth and admin: never cache
                 response.headers["Cache-Control"] = "no-store, private"
             elif request.method == "GET":
                 path = request.url.path
-                # Public read-heavy endpoints: cache aggressively
                 if any(p in path for p in ['/projects', '/explore', '/jobs']):
                     response.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=120"
                 elif '/feed' in path or '/notifications' in path:
-                    # Feed and notifications: very short cache
                     response.headers["Cache-Control"] = "private, max-age=5, stale-while-revalidate=30"
                 else:
                     response.headers["Cache-Control"] = "public, max-age=10, stale-while-revalidate=60"
 
-        # Ensure JSON responses include charset
+        # ── Ensure JSON responses include charset ──
         ct = response.headers.get("content-type", "")
         if "application/json" in ct and "charset" not in ct:
             response.headers["content-type"] = "application/json; charset=utf-8"
