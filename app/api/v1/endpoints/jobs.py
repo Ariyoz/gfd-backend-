@@ -63,6 +63,7 @@ async def list_jobs(
             "title": row["title"],
             "company": row["company"] or row["poster_name"] or "Company",
             "company_logo": row.get("company_logo") or row["poster_avatar"],
+            "company_url": row.get("company_url"),
             "description": row["description"] or "",
             "requirements": row.get("requirements"),
             "skills_required": row.get("skills_required") or [],
@@ -96,6 +97,8 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
                 poster_id UUID NOT NULL,
                 title VARCHAR(300) NOT NULL,
                 company VARCHAR(200),
+                company_logo TEXT,
+                company_url TEXT,
                 description TEXT NOT NULL DEFAULT '',
                 requirements TEXT,
                 skills_required TEXT[] DEFAULT '{}',
@@ -112,6 +115,10 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
+        """))
+        # Add company_url column if not exists (safe migration)
+        await db.execute(text("""
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS company_url TEXT
         """))
         await db.execute(text("""
             CREATE TABLE IF NOT EXISTS job_applications (
@@ -135,13 +142,15 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
 
         # Insert the job
         result = await db.execute(text("""
-            INSERT INTO jobs (id, poster_id, title, company, description, requirements, skills_required, job_type, experience_level, location, is_remote, salary_min, salary_max, salary_currency, status, application_count, view_count, created_at, updated_at)
-            VALUES (gen_random_uuid(), :poster_id, :title, :company, :description, :requirements, :skills_required, :job_type, :experience_level, :location, :is_remote, :salary_min, :salary_max, :salary_currency, 'open', 0, 0, NOW(), NOW())
+            INSERT INTO jobs (id, poster_id, title, company, company_logo, company_url, description, requirements, skills_required, job_type, experience_level, location, is_remote, salary_min, salary_max, salary_currency, status, application_count, view_count, created_at, updated_at)
+            VALUES (gen_random_uuid(), :poster_id, :title, :company, :company_logo, :company_url, :description, :requirements, :skills_required, :job_type, :experience_level, :location, :is_remote, :salary_min, :salary_max, :salary_currency, 'open', 0, 0, NOW(), NOW())
             RETURNING id
         """), {
             "poster_id": str(user.id),
             "title": data["title"],
             "company": data.get("company") or user.full_name,
+            "company_logo": data.get("company_logo"),
+            "company_url": data.get("company_url"),
             "description": data.get("description") or "",
             "requirements": data.get("requirements"),
             "skills_required": data.get("skills_required") or [],
