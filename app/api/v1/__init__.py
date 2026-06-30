@@ -1,7 +1,7 @@
 """API v1 router aggregation."""
 
 from fastapi import APIRouter
-from .endpoints import auth, users, feed, projects, messages, notifications, github, admin, uploads, explore, hire, jobs, subscriptions, wallet
+from .endpoints import auth, users, feed, projects, messages, notifications, github, admin, uploads, explore, hire, jobs, subscriptions
 
 api_router = APIRouter(prefix="/api/v1")
 
@@ -15,7 +15,6 @@ api_router.include_router(hire.router, prefix="/hire", tags=["Direct Hiring"])
 api_router.include_router(messages.router, prefix="/messages", tags=["Messaging"])
 api_router.include_router(notifications.router, prefix="/notifications", tags=["Notifications"])
 api_router.include_router(subscriptions.router, prefix="/subscriptions", tags=["Subscriptions & Plans"])
-api_router.include_router(wallet.router, prefix="/wallet", tags=["Wallet & Payments"])
 api_router.include_router(github.router, prefix="/github", tags=["GitHub Integration"])
 api_router.include_router(uploads.router, prefix="/uploads", tags=["File Uploads"])
 api_router.include_router(admin.router, prefix="/admin", tags=["Admin"])
