@@ -167,6 +167,51 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
 
 
 # ── MUST be before /{job_id} so FastAPI matches it correctly ──
+
+@router.get("/my-posted")
+async def my_posted_jobs(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all jobs posted by the current user (clients/companies)."""
+    from sqlalchemy import text
+    result = await db.execute(text("""
+        SELECT j.*, u.full_name as poster_name, u.avatar as poster_avatar
+        FROM jobs j
+        LEFT JOIN users u ON u.id = j.poster_id
+        WHERE j.poster_id = CAST(:user_id AS UUID)
+        ORDER BY j.created_at DESC
+    """), {"user_id": str(user.id)})
+    rows = result.mappings().all()
+    return {
+        "jobs": [
+            {
+                "id": str(row["id"]),
+                "title": row["title"],
+                "company": row["company"] or row["poster_name"] or "Company",
+                "company_logo": row.get("company_logo") or row["poster_avatar"],
+                "company_url": row.get("company_url"),
+                "description": row["description"] or "",
+                "requirements": row.get("requirements"),
+                "skills_required": row.get("skills_required") or [],
+                "job_type": row.get("job_type") or "full_time",
+                "experience_level": row.get("experience_level"),
+                "location": row.get("location"),
+                "is_remote": row.get("is_remote", True),
+                "salary_min": row.get("salary_min"),
+                "salary_max": row.get("salary_max"),
+                "salary_currency": row.get("salary_currency") or "USD",
+                "status": row.get("status") or "open",
+                "application_count": row.get("application_count") or 0,
+                "view_count": row.get("view_count") or 0,
+                "poster_name": row["poster_name"] or "Unknown",
+                "created_at": str(row["created_at"]) if row.get("created_at") else "",
+            }
+            for row in rows
+        ]
+    }
+
+
 @router.get("/my-applications")
 async def my_applications(
     user: User = Depends(get_current_active_user),
@@ -183,7 +228,7 @@ async def my_applications(
             ja.years_experience, ja.expected_salary, ja.availability,
             ja.created_at, ja.updated_at,
             j.title AS job_title, j.company AS job_company,
-            j.job_type, j.location, j.salary_min, j.salary_max, j.salary_currency,
+            j.job_type, j.location, j.is_remote, j.salary_min, j.salary_max, j.salary_currency,
             u.full_name AS poster_name, u.avatar AS poster_avatar
         FROM job_applications ja
         JOIN jobs  j ON j.id  = ja.job_id
@@ -213,6 +258,7 @@ async def my_applications(
                 "job_company":      row["job_company"] or "",
                 "job_type":         row["job_type"] or "",
                 "location":         row["location"] or "",
+                "is_remote":        row.get("is_remote", False),
                 "salary_min":       row["salary_min"],
                 "salary_max":       row["salary_max"],
                 "salary_currency":  row["salary_currency"] or "USD",
