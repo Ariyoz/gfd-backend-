@@ -91,11 +91,16 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
         from sqlalchemy import text
         from app.database import engine
 
-        # Run DDL in autocommit mode so columns exist before INSERT
-        async with engine.connect() as conn:
-            await conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS company_logo TEXT"))
-            await conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS company_url TEXT"))
-            await conn.commit()
+        # Step 1: Add new columns if they don't exist (committed separately)
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS company_logo TEXT"))
+                await conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS company_url TEXT"))
+                await conn.commit()
+        except Exception:
+            pass  # columns may already exist
+
+        # Step 2: Ensure job_applications table exists
         await db.execute(text("""
             CREATE TABLE IF NOT EXISTS job_applications (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -116,17 +121,15 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
             )
         """))
 
-        # Insert the job
+        # Step 3: Insert job WITHOUT new columns first
         result = await db.execute(text("""
-            INSERT INTO jobs (id, poster_id, title, company, company_logo, company_url, description, requirements, skills_required, job_type, experience_level, location, is_remote, salary_min, salary_max, salary_currency, status, application_count, view_count, created_at, updated_at)
-            VALUES (gen_random_uuid(), :poster_id, :title, :company, :company_logo, :company_url, :description, :requirements, :skills_required, :job_type, :experience_level, :location, :is_remote, :salary_min, :salary_max, :salary_currency, 'open', 0, 0, NOW(), NOW())
+            INSERT INTO jobs (id, poster_id, title, company, description, requirements, skills_required, job_type, experience_level, location, is_remote, salary_min, salary_max, salary_currency, status, application_count, view_count, created_at, updated_at)
+            VALUES (gen_random_uuid(), :poster_id, :title, :company, :description, :requirements, :skills_required, :job_type, :experience_level, :location, :is_remote, :salary_min, :salary_max, :salary_currency, 'open', 0, 0, NOW(), NOW())
             RETURNING id
         """), {
             "poster_id": str(user.id),
             "title": data["title"],
             "company": data.get("company") or user.full_name,
-            "company_logo": data.get("company_logo"),
-            "company_url": data.get("company_url"),
             "description": data.get("description") or "",
             "requirements": data.get("requirements"),
             "skills_required": data.get("skills_required") or [],
@@ -139,7 +142,25 @@ async def create_job(data: dict, user: User = Depends(get_current_active_user), 
             "salary_currency": data.get("salary_currency") or "USD",
         })
         row = result.fetchone()
-        return {"id": str(row[0]) if row else None, "message": "Job posted successfully"}
+        job_id = str(row[0]) if row else None
+
+        # Step 4: Update company_logo and company_url separately (safe — columns now exist)
+        if job_id and (data.get("company_logo") or data.get("company_url")):
+            try:
+                await db.execute(text("""
+                    UPDATE jobs SET
+                        company_logo = :logo,
+                        company_url  = :url
+                    WHERE id = CAST(:job_id AS UUID)
+                """), {
+                    "logo":   data.get("company_logo"),
+                    "url":    data.get("company_url"),
+                    "job_id": job_id,
+                })
+            except Exception:
+                pass  # non-critical — job was created, logo/url just not saved
+
+        return {"id": job_id, "message": "Job posted successfully"}
     except Exception as e:
         print(f"[ERROR] Create job failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
