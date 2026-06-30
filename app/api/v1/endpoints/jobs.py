@@ -357,6 +357,53 @@ async def get_job_applications(job_id: str, user: User = Depends(get_current_act
     return {"applications": app_list, "total": len(app_list)}
 
 
+@router.patch("/{job_id}")
+async def update_job(job_id: str, data: dict, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Edit a job posting — only the poster can update it."""
+    from sqlalchemy import text
+
+    # Verify ownership
+    check = await db.execute(text("SELECT poster_id FROM jobs WHERE id = :job_id"), {"job_id": job_id})
+    row = check.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if str(row[0]) != str(user.id):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # Build SET clause dynamically from provided fields
+    allowed = {
+        "title", "company", "company_logo", "company_url",
+        "description", "requirements", "skills_required",
+        "job_type", "experience_level", "location",
+        "is_remote", "salary_min", "salary_max", "salary_currency",
+    }
+    updates = {k: v for k, v in data.items() if k in allowed}
+    if not updates:
+        return {"message": "Nothing to update"}
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+    updates["job_id"] = job_id
+    updates["updated_at"] = "NOW()"
+
+    await db.execute(
+        text(f"UPDATE jobs SET {set_clause}, updated_at = NOW() WHERE id = :job_id"),
+        updates,
+    )
+    return {"message": "Job updated"}
+
+
+@router.patch("/{job_id}/close")
+async def close_job(job_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
+    """Close a job posting — no more applications."""
+    from sqlalchemy import text
+    check = await db.execute(text("SELECT poster_id FROM jobs WHERE id = :job_id"), {"job_id": job_id})
+    row = check.fetchone()
+    if not row or str(row[0]) != str(user.id):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    await db.execute(text("UPDATE jobs SET status = 'closed', updated_at = NOW() WHERE id = :job_id"), {"job_id": job_id})
+    return {"message": "Job closed"}
+
+
 @router.delete("/{job_id}")
 async def delete_job(job_id: str, user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
     """Delete a job posting (only poster can delete)."""
