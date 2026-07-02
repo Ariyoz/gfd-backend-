@@ -68,7 +68,7 @@ async def get_conversations(user: User = Depends(get_current_active_user), db: A
             "avatar": other_avatar,
             "online": other_online,
             "last_message_content": conv.last_message_content,
-            "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
+            "last_message_at": conv.last_message_at if isinstance(conv.last_message_at, str) else (conv.last_message_at.isoformat() if conv.last_message_at else None),
             "is_active": conv.is_active,
             "other_user_id": str(other_user_id) if other_user_id else None,
             "unread_count": my_unread,
@@ -213,7 +213,7 @@ async def send_message(
         .where(Conversation.id == UUID(conv_id))
         .values(
             last_message_content=(content or "📎 Attachment")[:100],
-            last_message_at=msg.created_at,
+            last_message_at=str(msg.created_at) if msg.created_at else None,
         )
     )
 
