@@ -543,7 +543,10 @@ async def send_contract(
     await db.execute(
         update(Conversation)
         .where(Conversation.id == UUID(conv_id))
-        .values(last_message_content="📋 Contract proposal sent", last_message_at=msg.created_at)
+        .values(
+            last_message_content="Contract proposal sent",
+            last_message_at=str(msg.created_at) if msg.created_at else None,
+        )
     )
 
     # Notify the other participant
