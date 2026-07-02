@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, update, text
 from uuid import UUID
+import json
 
 from app.database import get_db
 from app.models import Conversation, ConversationParticipant, Message, User
@@ -474,3 +475,167 @@ async def edit_message(message_id: str, data: dict, user: User = Depends(get_cur
     msg.content = data.get("content", msg.content)
     msg.is_edited = True
     return {"message": "Message updated"}
+
+
+# ══════════════════════════════════════════
+# CONTRACT ENDPOINTS
+# ══════════════════════════════════════════
+
+@router.post("/conversations/{conv_id}/contract")
+async def send_contract(
+    conv_id: str,
+    data: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Client sends a contract proposal inside a conversation."""
+    from app.models import Notification, NotificationType
+
+    # Verify participant
+    part = await db.execute(
+        select(ConversationParticipant).where(
+            ConversationParticipant.conversation_id == UUID(conv_id),
+            ConversationParticipant.user_id == user.id,
+        )
+    )
+    if not part.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    # Check no active contract already exists
+    existing = await db.execute(
+        select(Message).where(
+            Message.conversation_id == UUID(conv_id),
+            Message.message_type == "contract",
+        )
+    )
+    for ex_msg in existing.scalars().all():
+        try:
+            ex_data = json.loads(ex_msg.content or "{}")
+            if ex_data.get("status") == "active":
+                raise HTTPException(status_code=400, detail="An active contract already exists in this conversation")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    contract_data = {
+        "title": data.get("title", ""),
+        "description": data.get("description", ""),
+        "billing_type": data.get("billing_type", "fixed"),  # fixed | hourly
+        "amount": data.get("amount"),
+        "hourly_rate": data.get("hourly_rate"),
+        "weekly_limit": data.get("weekly_limit"),
+        "deadline": data.get("deadline"),
+        "status": "pending",  # pending | active | declined | completed
+        "client_id": str(user.id),
+        "client_name": user.full_name or "",
+    }
+
+    msg = Message(
+        conversation_id=UUID(conv_id),
+        sender_id=user.id,
+        content=json.dumps(contract_data),
+        message_type="contract",
+    )
+    db.add(msg)
+    await db.flush()
+    msg_id = str(msg.id)
+
+    # Update conversation preview
+    await db.execute(
+        update(Conversation)
+        .where(Conversation.id == UUID(conv_id))
+        .values(last_message_content="📋 Contract proposal sent", last_message_at=msg.created_at)
+    )
+
+    # Notify the other participant
+    parts_result = await db.execute(
+        select(ConversationParticipant).where(
+            ConversationParticipant.conversation_id == UUID(conv_id),
+            ConversationParticipant.user_id != user.id,
+        )
+    )
+    for participant in parts_result.scalars().all():
+        await ws_manager.send_to_user(str(participant.user_id), {
+            "type": "message_sent",
+            "from": str(user.id),
+            "from_name": user.full_name,
+            "from_avatar": user.avatar or "",
+            "content": json.dumps(contract_data),
+            "conversation_id": conv_id,
+            "message_id": msg_id,
+            "message_type": "contract",
+            "media_url": None,
+            "file_name": None,
+            "reply_preview": None,
+            "reactions": {},
+            "timestamp": str(msg.created_at) if msg.created_at else None,
+        })
+        await db.execute(
+            update(ConversationParticipant)
+            .where(
+                ConversationParticipant.conversation_id == UUID(conv_id),
+                ConversationParticipant.user_id == participant.user_id,
+            )
+            .values(unread_count=ConversationParticipant.unread_count + 1)
+        )
+        db.add(Notification(
+            user_id=participant.user_id,
+            actor_id=user.id,
+            type=NotificationType.MESSAGE,
+            title=f"Contract proposal from {user.full_name}",
+            body=f"📋 {data.get('title', 'New contract')}",
+            data={"conversation_id": conv_id},
+            action_url="/messaging",
+        ))
+
+    return {"id": msg_id, "message": "Contract proposal sent", "contract": contract_data}
+
+
+@router.patch("/messages/{message_id}/contract")
+async def respond_to_contract(
+    message_id: str,
+    data: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Developer accepts or declines a contract proposal."""
+    result = await db.execute(select(Message).where(Message.id == UUID(message_id)))
+    msg = result.scalar_one_or_none()
+    if not msg or msg.message_type != "contract":
+        raise HTTPException(status_code=404, detail="Contract message not found")
+
+    # Only the recipient (non-sender) can respond
+    if str(msg.sender_id) == str(user.id):
+        raise HTTPException(status_code=403, detail="You cannot respond to your own contract")
+
+    action = data.get("action")  # accept | decline
+    if action not in ("accept", "decline"):
+        raise HTTPException(status_code=400, detail="action must be 'accept' or 'decline'")
+
+    try:
+        contract_data = json.loads(msg.content or "{}")
+    except Exception:
+        contract_data = {}
+
+    if contract_data.get("status") not in ("pending",):
+        raise HTTPException(status_code=400, detail="Contract is no longer pending")
+
+    contract_data["status"] = "active" if action == "accept" else "declined"
+    contract_data["developer_id"] = str(user.id)
+    contract_data["developer_name"] = user.full_name or ""
+
+    await db.execute(
+        update(Message)
+        .where(Message.id == UUID(message_id))
+        .values(content=json.dumps(contract_data))
+    )
+
+    # Notify the client
+    await ws_manager.send_to_user(str(msg.sender_id), {
+        "type": "contract_update",
+        "message_id": message_id,
+        "conversation_id": str(msg.conversation_id),
+        "action": action,
+        "contract": contract_data,
+    })
+
+    return {"message": f"Contract {contract_data['status']}", "contract": contract_data}
