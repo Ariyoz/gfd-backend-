@@ -31,7 +31,7 @@ async def get_analytics(user: User = Depends(require_admin), db: AsyncSession = 
     # Messages count
     try:
         messages_count = (await db.execute(select(func.count()).select_from(Message))).scalar()
-    except:
+    except Exception:
         messages_count = 0
 
     # Subscription stats
@@ -39,7 +39,7 @@ async def get_analytics(user: User = Depends(require_admin), db: AsyncSession = 
         from sqlalchemy import text as raw_text
         pending_subs = (await db.execute(raw_text("SELECT COUNT(*) FROM subscriptions WHERE status = 'pending'"))).scalar() or 0
         active_subs = (await db.execute(raw_text("SELECT COUNT(*) FROM subscriptions WHERE status = 'active'"))).scalar() or 0
-    except:
+    except Exception:
         pending_subs = 0
         active_subs = 0
 
