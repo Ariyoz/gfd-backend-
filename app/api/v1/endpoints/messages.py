@@ -593,7 +593,7 @@ async def send_contract(
     return {"id": msg_id, "message": "Contract proposal sent", "contract": contract_data}
 
 
-@router.patch("/messages/{message_id}/contract")
+@router.patch("/{message_id}/contract")
 async def respond_to_contract(
     message_id: str,
     data: dict,
