@@ -3,6 +3,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -217,7 +218,18 @@ async def lifespan(app: FastAPI):
                     END IF;
                 END $$;
             """))
-        print("✅ Database columns verified")
+            # ── Performance indexes ──
+            await conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_jobs_poster ON jobs(poster_id);
+                CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+                CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_job_apps_applicant ON job_applications(applicant_id);
+                CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
+                CREATE INDEX IF NOT EXISTS idx_conv_participants_conv ON conversation_participants(conversation_id);
+                CREATE INDEX IF NOT EXISTS idx_conv_participants_user ON conversation_participants(user_id);
+            """))
+        print("✅ Database ready")
     except Exception as e:
         print(f"⚠️ Migration check: {e}")
 
