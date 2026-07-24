@@ -119,7 +119,8 @@ async def lifespan(app: FastAPI):
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """))
-            # ── Wallet tables ──
+            # ── Wallet tables — ensure correct schema ──
+            # Step 1: Create tables if they don't exist
             await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS wallets (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -186,55 +187,19 @@ async def lifespan(app: FastAPI):
                 CREATE INDEX IF NOT EXISTS idx_wr_user ON withdrawal_requests(user_id);
                 CREATE INDEX IF NOT EXISTS idx_wr_status ON withdrawal_requests(status);
             """))
-            # Backfill missing columns for existing deployments
+            # Step 2: Add missing columns using ADD COLUMN IF NOT EXISTS (PostgreSQL 9.6+)
             await conn.execute(text("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='wallets' AND column_name='total_spent') THEN
-                        ALTER TABLE wallets ADD COLUMN total_spent NUMERIC(12,2) DEFAULT 0;
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='wallets' AND column_name='is_frozen') THEN
-                        ALTER TABLE wallets ADD COLUMN is_frozen BOOLEAN DEFAULT FALSE;
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='wallets' AND column_name='updated_at') THEN
-                        ALTER TABLE wallets ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='wallet_transactions' AND column_name='fee') THEN
-                        ALTER TABLE wallet_transactions ADD COLUMN fee NUMERIC(12,2) DEFAULT 0;
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='wallet_transactions' AND column_name='balance_before') THEN
-                        ALTER TABLE wallet_transactions ADD COLUMN balance_before NUMERIC(12,2);
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='wallet_transactions' AND column_name='balance_after') THEN
-                        ALTER TABLE wallet_transactions ADD COLUMN balance_after NUMERIC(12,2);
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='wallet_transactions' AND column_name='provider') THEN
-                        ALTER TABLE wallet_transactions ADD COLUMN provider VARCHAR(30);
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='wallet_transactions' AND column_name='updated_at') THEN
-                        ALTER TABLE wallet_transactions ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='virtual_accounts' AND column_name='dva_id') THEN
-                        ALTER TABLE virtual_accounts ADD COLUMN dva_id VARCHAR(100);
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='virtual_accounts' AND column_name='is_active') THEN
-                        ALTER TABLE virtual_accounts ADD COLUMN is_active BOOLEAN DEFAULT TRUE;
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_name='virtual_accounts' AND column_name='updated_at') THEN
-                        ALTER TABLE virtual_accounts ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
-                    END IF;
-                END $$;
+                ALTER TABLE wallets ADD COLUMN IF NOT EXISTS total_spent NUMERIC(12,2) DEFAULT 0;
+                ALTER TABLE wallets ADD COLUMN IF NOT EXISTS is_frozen BOOLEAN DEFAULT FALSE;
+                ALTER TABLE wallets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+                ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS fee NUMERIC(12,2) DEFAULT 0;
+                ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS balance_before NUMERIC(12,2);
+                ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS balance_after NUMERIC(12,2);
+                ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS provider VARCHAR(30);
+                ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+                ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS dva_id VARCHAR(100);
+                ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
+                ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
             """))
             await conn.execute(text("""
                 DO $$
