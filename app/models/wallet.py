@@ -61,7 +61,7 @@ class WalletTransaction(BaseModel):
     reference = Column(String(100), unique=True, index=True, nullable=True)   # Payment gateway ref
     provider = Column(String(30), nullable=True)                      # paystack | flutterwave | manual
     status = Column(String(20), default="pending", nullable=False, index=True)
-    metadata = Column(Text, nullable=True)  # JSON string for extra data
+    extra_data = Column(Text, nullable=True)  # JSON string for extra data
 
     # Relationships
     wallet = relationship("Wallet", back_populates="transactions")
