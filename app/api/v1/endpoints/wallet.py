@@ -117,17 +117,20 @@ async def get_wallet(
     db: AsyncSession = Depends(get_db),
 ):
     """Get current user's wallet balance and stats."""
-    wallet = await _get_or_create_wallet(str(user.id), db)
-    return {
-        "id": str(wallet["id"]),
-        "user_id": str(wallet["user_id"]),
-        "balance": wallet["balance"],
-        "total_earned": wallet["total_earned"],
-        "total_withdrawn": wallet["total_withdrawn"],
-        "total_spent": wallet.get("total_spent", Decimal("0")),
-        "is_frozen": wallet.get("is_frozen", False),
-        "created_at": wallet["created_at"],
-    }
+    try:
+        wallet = await _get_or_create_wallet(str(user.id), db)
+        return {
+            "id": str(wallet["id"]),
+            "user_id": str(wallet["user_id"]),
+            "balance": wallet.get("balance") or Decimal("0"),
+            "total_earned": wallet.get("total_earned") or Decimal("0"),
+            "total_withdrawn": wallet.get("total_withdrawn") or Decimal("0"),
+            "total_spent": wallet.get("total_spent") or Decimal("0"),
+            "is_frozen": wallet.get("is_frozen") or False,
+            "created_at": wallet.get("created_at"),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Wallet error: {str(e)}")
 
 
 @router.get("/transactions", response_model=TransactionListResponse)
@@ -139,60 +142,63 @@ async def get_transactions(
     db: AsyncSession = Depends(get_db),
 ):
     """Get paginated wallet transaction history."""
-    wallet = await _get_or_create_wallet(str(user.id), db)
-    wallet_id = str(wallet["id"])
+    try:
+        wallet = await _get_or_create_wallet(str(user.id), db)
+        wallet_id = str(wallet["id"])
 
-    offset = (page - 1) * page_size
+        offset = (page - 1) * page_size
 
-    base_query = "FROM wallet_transactions WHERE wallet_id = CAST(:wid AS UUID)"
-    params: dict = {"wid": wallet_id}
+        base_query = "FROM wallet_transactions WHERE wallet_id = CAST(:wid AS UUID)"
+        params: dict = {"wid": wallet_id}
 
-    if tx_type:
-        base_query += " AND type = :type"
-        params["type"] = tx_type
+        if tx_type:
+            base_query += " AND type = :type"
+            params["type"] = tx_type
 
-    count_result = await db.execute(
-        text(f"SELECT COUNT(*) {base_query}"), params
-    )
-    total = count_result.scalar_one()
+        count_result = await db.execute(
+            text(f"SELECT COUNT(*) {base_query}"), params
+        )
+        total = count_result.scalar_one()
 
-    rows_result = await db.execute(
-        text(f"""
-            SELECT id, wallet_id, type, amount, fee, balance_before, balance_after,
-                   description, reference, provider, status, created_at
-            {base_query}
-            ORDER BY created_at DESC
-            LIMIT :limit OFFSET :offset
-        """),
-        {**params, "limit": page_size, "offset": offset},
-    )
-    rows = rows_result.mappings().all()
+        rows_result = await db.execute(
+            text(f"""
+                SELECT id, wallet_id, type, amount, fee, balance_before, balance_after,
+                       description, reference, provider, status, created_at
+                {base_query}
+                ORDER BY created_at DESC
+                LIMIT :limit OFFSET :offset
+            """),
+            {**params, "limit": page_size, "offset": offset},
+        )
+        rows = rows_result.mappings().all()
 
-    transactions = [
-        {
-            "id": str(r["id"]),
-            "wallet_id": str(r["wallet_id"]),
-            "type": r["type"],
-            "amount": r["amount"],
-            "fee": r.get("fee") or Decimal("0"),
-            "balance_before": r.get("balance_before"),
-            "balance_after": r.get("balance_after"),
-            "description": r.get("description"),
-            "reference": r.get("reference"),
-            "provider": r.get("provider"),
-            "status": r["status"],
-            "created_at": r["created_at"],
+        transactions = [
+            {
+                "id": str(r["id"]),
+                "wallet_id": str(r["wallet_id"]),
+                "type": r["type"],
+                "amount": r["amount"],
+                "fee": r.get("fee") or Decimal("0"),
+                "balance_before": r.get("balance_before"),
+                "balance_after": r.get("balance_after"),
+                "description": r.get("description"),
+                "reference": r.get("reference"),
+                "provider": r.get("provider"),
+                "status": r["status"],
+                "created_at": r.get("created_at"),
+            }
+            for r in rows
+        ]
+
+        return {
+            "transactions": transactions,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "has_more": (page * page_size) < total,
         }
-        for r in rows
-    ]
-
-    return {
-        "transactions": transactions,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "has_more": (page * page_size) < total,
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transactions error: {str(e)}")
 
 
 @router.post("/fund", response_model=FundWalletResponse)

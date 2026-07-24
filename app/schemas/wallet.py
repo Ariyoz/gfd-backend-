@@ -17,7 +17,7 @@ class WalletResponse(BaseModel):
     total_withdrawn: Decimal
     total_spent: Decimal
     is_frozen: bool
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 
@@ -30,13 +30,13 @@ class TransactionResponse(BaseModel):
     type: str
     amount: Decimal
     fee: Decimal
-    balance_before: Optional[Decimal]
-    balance_after: Optional[Decimal]
-    description: Optional[str]
-    reference: Optional[str]
-    provider: Optional[str]
+    balance_before: Optional[Decimal] = None
+    balance_after: Optional[Decimal] = None
+    description: Optional[str] = None
+    reference: Optional[str] = None
+    provider: Optional[str] = None
     status: str
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 
