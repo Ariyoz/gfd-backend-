@@ -378,6 +378,26 @@ app.add_middleware(RequestLoggingMiddleware)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# ── Global exception handler — always sends CORS headers even on 500 ──
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    origin = request.headers.get("origin", "")
+    allowed = _CORS_ORIGINS
+    cors_origin = origin if origin in allowed else (allowed[0] if allowed else "*")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Please try again."},
+        headers={
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
+
 # ── API Routes ──
 app.include_router(api_router)
 

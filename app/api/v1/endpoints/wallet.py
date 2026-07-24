@@ -210,9 +210,8 @@ async def fund_wallet(
     if wallet.get("is_frozen"):
         raise HTTPException(status_code=403, detail="Wallet is frozen. Contact support.")
 
-    if payload.provider == "paystack":
+    try:
         from app.integrations.paystack_service import initialize_payment, generate_reference
-
         reference = generate_reference()
         result = await initialize_payment(
             email=user.email,
@@ -220,17 +219,8 @@ async def fund_wallet(
             reference=reference,
             metadata={"user_id": str(user.id), "wallet_id": str(wallet["id"]), "type": "wallet_fund"},
         )
-    else:
-        from app.integrations.flutterwave_service import initialize_payment, generate_reference
-
-        reference = generate_reference()
-        result = await initialize_payment(
-            email=user.email,
-            full_name=user.full_name,
-            amount_naira=payload.amount,
-            reference=reference,
-            meta={"user_id": str(user.id), "wallet_id": str(wallet["id"]), "type": "wallet_fund"},
-        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Payment provider error: {str(e)}")
 
     # Record a PENDING transaction so we can match the webhook/verify call
     await db.execute(
@@ -239,13 +229,13 @@ async def fund_wallet(
               (id, wallet_id, type, amount, fee, description, reference, provider, status, created_at, updated_at)
             VALUES
               (gen_random_uuid(), CAST(:wid AS UUID), 'credit', :amount, 0,
-               'Wallet top-up', :ref, :prov, 'pending', NOW(), NOW())
+               'Wallet top-up', :ref, 'paystack', 'pending', NOW(), NOW())
         """),
         {
             "wid": str(wallet["id"]),
             "amount": str(payload.amount),
             "ref": reference,
-            "prov": payload.provider,
+            "prov": "paystack",
         },
     )
     await db.commit()
@@ -254,7 +244,7 @@ async def fund_wallet(
         "payment_url": result["payment_url"],
         "reference": reference,
         "amount": payload.amount,
-        "provider": payload.provider,
+        "provider": "paystack",
     }
 
 
