@@ -8,6 +8,7 @@ from .project import Project, Application, ProjectStatus, ProjectType, Applicati
 from .job import Job, JobApplication, JobType, JobStatus, JobApplicationStatus
 from .messaging import Conversation, ConversationParticipant, Message, ConversationType
 from .notification import Notification, ActivityLog, AuditLog, NotificationType
+from .wallet import Wallet, WalletTransaction, VirtualAccount, WithdrawalRequest, TransactionType, TransactionStatus, WithdrawalStatus
 
 __all__ = [
     "BaseModel",
@@ -18,4 +19,6 @@ __all__ = [
     "Job", "JobApplication", "JobType", "JobStatus", "JobApplicationStatus",
     "Conversation", "ConversationParticipant", "Message", "ConversationType",
     "Notification", "ActivityLog", "AuditLog", "NotificationType",
+    "Wallet", "WalletTransaction", "VirtualAccount", "WithdrawalRequest",
+    "TransactionType", "TransactionStatus", "WithdrawalStatus",
 ]
