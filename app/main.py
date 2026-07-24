@@ -316,8 +316,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ Migration check: {e}")
 
+    # ── Keep-alive: ping self every 10 min so Render free tier stays warm ──
+    import asyncio
+    import httpx
+
+    async def _keep_alive():
+        await asyncio.sleep(60)  # wait 1 min after boot before first ping
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.get("https://gfd-backend.onrender.com/health")
+                print("🏓 Keep-alive ping sent")
+            except Exception:
+                pass  # silently ignore — server may be restarting
+            await asyncio.sleep(600)  # every 10 minutes
+
+    keep_alive_task = asyncio.create_task(_keep_alive())
+
     yield
+
     # Shutdown
+    keep_alive_task.cancel()
     print("👋 GFD Backend shutting down...")
 
 
