@@ -127,17 +127,25 @@ async def lifespan(app: FastAPI):
                     balance NUMERIC(12,2) DEFAULT 0,
                     total_earned NUMERIC(12,2) DEFAULT 0,
                     total_withdrawn NUMERIC(12,2) DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT NOW()
+                    total_spent NUMERIC(12,2) DEFAULT 0,
+                    is_frozen BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
                 );
                 CREATE TABLE IF NOT EXISTS wallet_transactions (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
                     type VARCHAR(20) NOT NULL,
                     amount NUMERIC(12,2) NOT NULL,
+                    fee NUMERIC(12,2) DEFAULT 0,
+                    balance_before NUMERIC(12,2),
+                    balance_after NUMERIC(12,2),
                     description TEXT,
-                    reference VARCHAR(100),
+                    reference VARCHAR(100) UNIQUE,
+                    provider VARCHAR(30),
                     status VARCHAR(20) DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT NOW()
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
                 );
                 CREATE TABLE IF NOT EXISTS virtual_accounts (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -147,11 +155,86 @@ async def lifespan(app: FastAPI):
                     account_number VARCHAR(20),
                     provider VARCHAR(50),
                     customer_code VARCHAR(100),
-                    created_at TIMESTAMP DEFAULT NOW()
+                    dva_id VARCHAR(100),
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS withdrawal_requests (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+                    amount NUMERIC(12,2) NOT NULL,
+                    fee NUMERIC(12,2) DEFAULT 0,
+                    net_amount NUMERIC(12,2) NOT NULL,
+                    bank_name VARCHAR(100) NOT NULL,
+                    account_name VARCHAR(200) NOT NULL,
+                    account_number VARCHAR(20) NOT NULL,
+                    bank_code VARCHAR(20),
+                    status VARCHAR(20) DEFAULT 'pending',
+                    reference VARCHAR(100) UNIQUE,
+                    provider VARCHAR(30),
+                    rejection_reason TEXT,
+                    processed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
                 );
                 CREATE INDEX IF NOT EXISTS idx_wt_wallet ON wallet_transactions(wallet_id);
                 CREATE INDEX IF NOT EXISTS idx_wt_reference ON wallet_transactions(reference);
+                CREATE INDEX IF NOT EXISTS idx_wt_status ON wallet_transactions(status);
                 CREATE INDEX IF NOT EXISTS idx_va_user ON virtual_accounts(user_id);
+                CREATE INDEX IF NOT EXISTS idx_wr_user ON withdrawal_requests(user_id);
+                CREATE INDEX IF NOT EXISTS idx_wr_status ON withdrawal_requests(status);
+            """))
+            # Backfill missing columns for existing deployments
+            await conn.execute(text("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='wallets' AND column_name='total_spent') THEN
+                        ALTER TABLE wallets ADD COLUMN total_spent NUMERIC(12,2) DEFAULT 0;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='wallets' AND column_name='is_frozen') THEN
+                        ALTER TABLE wallets ADD COLUMN is_frozen BOOLEAN DEFAULT FALSE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='wallets' AND column_name='updated_at') THEN
+                        ALTER TABLE wallets ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='wallet_transactions' AND column_name='fee') THEN
+                        ALTER TABLE wallet_transactions ADD COLUMN fee NUMERIC(12,2) DEFAULT 0;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='wallet_transactions' AND column_name='balance_before') THEN
+                        ALTER TABLE wallet_transactions ADD COLUMN balance_before NUMERIC(12,2);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='wallet_transactions' AND column_name='balance_after') THEN
+                        ALTER TABLE wallet_transactions ADD COLUMN balance_after NUMERIC(12,2);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='wallet_transactions' AND column_name='provider') THEN
+                        ALTER TABLE wallet_transactions ADD COLUMN provider VARCHAR(30);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='wallet_transactions' AND column_name='updated_at') THEN
+                        ALTER TABLE wallet_transactions ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='virtual_accounts' AND column_name='dva_id') THEN
+                        ALTER TABLE virtual_accounts ADD COLUMN dva_id VARCHAR(100);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='virtual_accounts' AND column_name='is_active') THEN
+                        ALTER TABLE virtual_accounts ADD COLUMN is_active BOOLEAN DEFAULT TRUE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name='virtual_accounts' AND column_name='updated_at') THEN
+                        ALTER TABLE virtual_accounts ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
+                    END IF;
+                END $$;
             """))
             await conn.execute(text("""
                 DO $$
@@ -233,8 +316,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ Migration check: {e}")
 
+    # ── Keep-alive: ping self every 10 min so Render free tier stays warm ──
+    import asyncio
+    import httpx
+
+    async def _keep_alive():
+        await asyncio.sleep(60)  # wait 1 min after boot before first ping
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.get("https://gfd-backend.onrender.com/health")
+                print("🏓 Keep-alive ping sent")
+            except Exception:
+                pass  # silently ignore — server may be restarting
+            await asyncio.sleep(600)  # every 10 minutes
+
+    keep_alive_task = asyncio.create_task(_keep_alive())
+
     yield
+
     # Shutdown
+    keep_alive_task.cancel()
     print("👋 GFD Backend shutting down...")
 
 

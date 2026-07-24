@@ -506,3 +506,295 @@ async def admin_remove_project(
     db.add(AuditLog(admin_id=admin.id, action="delete_project", target_type="project", target_id=UUID(project_id)))
     await db.delete(project)
     return {"message": "Project deleted"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Wallet Admin Endpoints
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/wallet/withdrawals")
+async def admin_list_withdrawals(
+    status_filter: str = Query("pending"),
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all withdrawal requests for admin review."""
+    from sqlalchemy import text
+    result = await db.execute(text("""
+        SELECT
+            wr.id, wr.user_id, wr.amount, wr.fee, wr.net_amount,
+            wr.bank_name, wr.account_name, wr.account_number, wr.bank_code,
+            wr.status, wr.reference, wr.provider, wr.rejection_reason, wr.created_at,
+            u.full_name AS user_name, u.email AS user_email, u.avatar AS user_avatar
+        FROM withdrawal_requests wr
+        JOIN users u ON u.id = wr.user_id
+        WHERE wr.status = :status
+        ORDER BY wr.created_at ASC
+    """), {"status": status_filter})
+    rows = result.mappings().all()
+    return {
+        "withdrawals": [
+            {
+                "id": str(r["id"]),
+                "user_id": str(r["user_id"]),
+                "user_name": r["user_name"],
+                "user_email": r["user_email"],
+                "user_avatar": r.get("user_avatar"),
+                "amount": str(r["amount"]),
+                "fee": str(r["fee"]),
+                "net_amount": str(r["net_amount"]),
+                "bank_name": r["bank_name"],
+                "account_name": r["account_name"],
+                "account_number": r["account_number"],
+                "bank_code": r.get("bank_code"),
+                "status": r["status"],
+                "reference": r.get("reference"),
+                "provider": r.get("provider"),
+                "rejection_reason": r.get("rejection_reason"),
+                "created_at": str(r["created_at"]),
+            }
+            for r in rows
+        ],
+        "total": len(rows),
+    }
+
+
+@router.patch("/wallet/withdrawals/{request_id}/approve")
+async def admin_approve_withdrawal(
+    request_id: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Approve a withdrawal request.
+    Marks as 'processing' — actual bank transfer should be triggered manually or via job.
+    """
+    from sqlalchemy import text
+    result = await db.execute(
+        text("SELECT id, status FROM withdrawal_requests WHERE id = CAST(:rid AS UUID)"),
+        {"rid": request_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Withdrawal request not found")
+    if row["status"] != "pending":
+        raise HTTPException(status_code=400, detail=f"Cannot approve a {row['status']} request")
+
+    await db.execute(
+        text("""
+            UPDATE withdrawal_requests
+            SET status = 'processing', processed_by = CAST(:admin_id AS UUID), updated_at = NOW()
+            WHERE id = CAST(:rid AS UUID)
+        """),
+        {"rid": request_id, "admin_id": str(admin.id)},
+    )
+    await db.execute(
+        text("""
+            UPDATE wallet_transactions SET status = 'processing', updated_at = NOW()
+            WHERE reference = (SELECT reference FROM withdrawal_requests WHERE id = CAST(:rid AS UUID))
+              AND type = 'withdrawal'
+        """),
+        {"rid": request_id},
+    )
+    db.add(AuditLog(
+        admin_id=admin.id,
+        action="approve_withdrawal",
+        target_type="withdrawal_request",
+        target_id=UUID(request_id),
+    ))
+    await db.commit()
+    return {"message": "Withdrawal approved and marked as processing"}
+
+
+@router.patch("/wallet/withdrawals/{request_id}/reject")
+async def admin_reject_withdrawal(
+    request_id: str,
+    data: dict,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Reject a withdrawal and refund the balance back to the wallet.
+    """
+    from decimal import Decimal
+    from sqlalchemy import text
+
+    reason = data.get("reason", "Rejected by admin")
+
+    result = await db.execute(
+        text("""
+            SELECT wr.id, wr.status, wr.amount, wr.fee, wr.wallet_id, wr.reference
+            FROM withdrawal_requests wr
+            WHERE wr.id = CAST(:rid AS UUID)
+        """),
+        {"rid": request_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Withdrawal request not found")
+    if row["status"] not in ("pending", "processing"):
+        raise HTTPException(status_code=400, detail=f"Cannot reject a {row['status']} request")
+
+    refund_amount = Decimal(str(row["amount"])) + Decimal(str(row["fee"]))
+
+    # Refund balance
+    await db.execute(
+        text("""
+            UPDATE wallets
+            SET balance = balance + :refund,
+                total_withdrawn = GREATEST(total_withdrawn - :amount, 0),
+                updated_at = NOW()
+            WHERE id = CAST(:wid AS UUID)
+        """),
+        {"refund": str(refund_amount), "amount": str(row["amount"]), "wid": str(row["wallet_id"])},
+    )
+
+    # Update request status
+    await db.execute(
+        text("""
+            UPDATE withdrawal_requests
+            SET status = 'rejected', rejection_reason = :reason,
+                processed_by = CAST(:admin_id AS UUID), updated_at = NOW()
+            WHERE id = CAST(:rid AS UUID)
+        """),
+        {"rid": request_id, "reason": reason, "admin_id": str(admin.id)},
+    )
+
+    # Record refund transaction
+    await db.execute(
+        text("""
+            INSERT INTO wallet_transactions
+              (id, wallet_id, type, amount, fee, description, reference, provider, status, created_at, updated_at)
+            VALUES
+              (gen_random_uuid(), CAST(:wid AS UUID), 'refund', :amount, 0,
+               :desc, :ref, 'manual', 'success', NOW(), NOW())
+        """),
+        {
+            "wid": str(row["wallet_id"]),
+            "amount": str(refund_amount),
+            "desc": f"Withdrawal rejected: {reason}",
+            "ref": f"REFUND-{row['reference']}",
+        },
+    )
+
+    # Update original withdrawal tx status
+    await db.execute(
+        text("""
+            UPDATE wallet_transactions SET status = 'reversed', updated_at = NOW()
+            WHERE reference = :ref AND type = 'withdrawal'
+        """),
+        {"ref": row["reference"]},
+    )
+
+    db.add(AuditLog(
+        admin_id=admin.id,
+        action="reject_withdrawal",
+        target_type="withdrawal_request",
+        target_id=UUID(request_id),
+        reason=reason,
+    ))
+    await db.commit()
+    return {"message": "Withdrawal rejected and funds refunded to wallet"}
+
+
+@router.patch("/wallet/withdrawals/{request_id}/complete")
+async def admin_complete_withdrawal(
+    request_id: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark a withdrawal as successfully completed (after manual bank transfer)."""
+    from sqlalchemy import text
+    result = await db.execute(
+        text("SELECT status FROM withdrawal_requests WHERE id = CAST(:rid AS UUID)"),
+        {"rid": request_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Withdrawal request not found")
+    if row["status"] != "processing":
+        raise HTTPException(status_code=400, detail=f"Request is {row['status']}, expected processing")
+
+    await db.execute(
+        text("""
+            UPDATE withdrawal_requests
+            SET status = 'success', processed_by = CAST(:admin_id AS UUID), updated_at = NOW()
+            WHERE id = CAST(:rid AS UUID)
+        """),
+        {"rid": request_id, "admin_id": str(admin.id)},
+    )
+    await db.execute(
+        text("""
+            UPDATE wallet_transactions SET status = 'success', updated_at = NOW()
+            WHERE reference = (SELECT reference FROM withdrawal_requests WHERE id = CAST(:rid AS UUID))
+              AND type = 'withdrawal'
+        """),
+        {"rid": request_id},
+    )
+    db.add(AuditLog(
+        admin_id=admin.id,
+        action="complete_withdrawal",
+        target_type="withdrawal_request",
+        target_id=UUID(request_id),
+    ))
+    await db.commit()
+    return {"message": "Withdrawal marked as completed"}
+
+
+@router.get("/wallet/stats")
+async def admin_wallet_stats(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Platform-wide wallet statistics."""
+    from sqlalchemy import text
+    result = await db.execute(text("""
+        SELECT
+            COUNT(*)                                  AS total_wallets,
+            COALESCE(SUM(balance), 0)                 AS total_balance,
+            COALESCE(SUM(total_earned), 0)            AS total_earned,
+            COALESCE(SUM(total_withdrawn), 0)         AS total_withdrawn,
+            COUNT(*) FILTER (WHERE is_frozen = TRUE)  AS frozen_wallets
+        FROM wallets
+    """))
+    row = result.mappings().first()
+
+    pending_wd = await db.execute(text("""
+        SELECT COUNT(*), COALESCE(SUM(amount), 0) AS pending_amount
+        FROM withdrawal_requests WHERE status = 'pending'
+    """))
+    wd_row = pending_wd.mappings().first()
+
+    return {
+        "total_wallets": row["total_wallets"],
+        "total_balance": str(row["total_balance"]),
+        "total_earned": str(row["total_earned"]),
+        "total_withdrawn": str(row["total_withdrawn"]),
+        "frozen_wallets": row["frozen_wallets"],
+        "pending_withdrawals": wd_row["count"],
+        "pending_withdrawal_amount": str(wd_row["pending_amount"]),
+    }
+
+
+@router.patch("/wallet/{user_id}/freeze")
+async def admin_freeze_wallet(
+    user_id: str,
+    data: dict,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Freeze or unfreeze a user's wallet."""
+    from sqlalchemy import text
+    freeze = data.get("freeze", True)
+    await db.execute(
+        text("UPDATE wallets SET is_frozen = :f, updated_at = NOW() WHERE user_id = CAST(:uid AS UUID)"),
+        {"f": freeze, "uid": user_id},
+    )
+    db.add(AuditLog(
+        admin_id=admin.id,
+        action="freeze_wallet" if freeze else "unfreeze_wallet",
+        target_type="wallet",
+        after_state={"user_id": user_id, "is_frozen": freeze},
+    ))
+    await db.commit()
+    return {"message": f"Wallet {'frozen' if freeze else 'unfrozen'}"}
