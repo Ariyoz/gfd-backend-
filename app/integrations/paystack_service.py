@@ -251,3 +251,21 @@ async def list_banks(country: str = "nigeria") -> list:
         {"name": b["name"], "code": b["code"], "slug": b.get("slug", "")}
         for b in data["data"]
     ]
+
+
+# ── Resolve bank account number → account name ────────────────────────────────
+
+async def resolve_account(account_number: str, bank_code: str) -> str:
+    """Verify an account number and return the account name."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{PAYSTACK_BASE}/bank/resolve",
+            params={"account_number": account_number, "bank_code": bank_code},
+            headers=_headers(),
+        )
+        data = resp.json()
+
+    if not data.get("status"):
+        raise ValueError(data.get("message", "Could not verify account number"))
+
+    return data["data"]["account_name"]

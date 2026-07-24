@@ -53,7 +53,7 @@ class TransactionListResponse(BaseModel):
 
 class FundWalletRequest(BaseModel):
     amount: Decimal
-    provider: str = "paystack"   # paystack | flutterwave
+    provider: str = "paystack"
 
     @field_validator("amount")
     @classmethod
@@ -62,13 +62,6 @@ class FundWalletRequest(BaseModel):
             raise ValueError("Amount must be greater than zero")
         if v < Decimal("100"):
             raise ValueError("Minimum funding amount is ₦100")
-        return v
-
-    @field_validator("provider")
-    @classmethod
-    def validate_provider(cls, v: str) -> str:
-        if v not in ("paystack", "flutterwave"):
-            raise ValueError("Provider must be paystack or flutterwave")
         return v
 
 
@@ -112,7 +105,7 @@ class WithdrawResponse(BaseModel):
     account_name: str
     account_number: str
     status: str
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 

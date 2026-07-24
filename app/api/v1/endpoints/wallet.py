@@ -305,27 +305,39 @@ async def verify_payment(
         await db.commit()
         raise HTTPException(status_code=402, detail="Payment not completed or failed")
 
-    # Credit the wallet
+    # Credit the wallet — update existing pending tx in place (avoids UNIQUE reference clash)
     wallet = await _get_or_create_wallet(str(user.id), db)
     amount = Decimal(str(result["amount_naira"]))
 
-    await _credit_wallet(
-        wallet_id=str(wallet["id"]),
-        amount=amount,
-        description="Wallet top-up",
-        reference=payload.reference,
-        provider=payload.provider,
-        db=db,
+    # Lock wallet row and get current balance
+    bal_row = await db.execute(
+        text("SELECT balance FROM wallets WHERE id = CAST(:wid AS UUID) FOR UPDATE"),
+        {"wid": str(wallet["id"])},
+    )
+    current = Decimal(str(bal_row.mappings().first()["balance"]))
+    new_balance = current + amount
+
+    # Update wallet balance
+    await db.execute(
+        text("""
+            UPDATE wallets
+            SET balance = :bal, total_earned = total_earned + :amt, updated_at = NOW()
+            WHERE id = CAST(:wid AS UUID)
+        """),
+        {"bal": str(new_balance), "amt": str(amount), "wid": str(wallet["id"])},
     )
 
-    # Mark the pending transaction as success (credit_wallet already inserted a new success record)
+    # Update the pending tx to success — no new insert, avoids UNIQUE constraint on reference
     await db.execute(
         text("""
             UPDATE wallet_transactions
-            SET status = 'success', updated_at = NOW()
+            SET status        = 'success',
+                balance_before = :bb,
+                balance_after  = :ba,
+                updated_at    = NOW()
             WHERE reference = :ref AND status = 'pending'
         """),
-        {"ref": payload.reference},
+        {"bb": str(current), "ba": str(new_balance), "ref": payload.reference},
     )
     await db.commit()
 
@@ -334,7 +346,6 @@ async def verify_payment(
         "amount": str(amount),
         "status": "success",
     }
-
 
 @router.post("/withdraw", response_model=WithdrawResponse)
 async def withdraw(
@@ -585,15 +596,29 @@ async def get_banks(
 ):
     """List supported banks for withdrawal."""
     try:
-        if provider == "flutterwave":
-            from app.integrations.flutterwave_service import list_banks
-            banks = await list_banks()
-        else:
-            from app.integrations.paystack_service import list_banks
-            banks = await list_banks()
+        from app.integrations.paystack_service import list_banks
+        banks = await list_banks()
         return {"banks": banks}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not fetch banks: {str(e)}")
+
+
+@router.post("/verify-account")
+async def verify_bank_account(
+    payload: dict,
+    user: User = Depends(get_current_active_user),
+):
+    """Resolve account number → account name via Paystack."""
+    account_number = payload.get("account_number", "")
+    bank_code = payload.get("bank_code", "")
+    if not account_number or not bank_code:
+        raise HTTPException(status_code=400, detail="account_number and bank_code are required")
+    try:
+        from app.integrations.paystack_service import resolve_account
+        account_name = await resolve_account(account_number, bank_code)
+        return {"account_name": account_name}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -644,22 +669,31 @@ async def paystack_webhook(
             return {"status": "already_processed"}
 
         wallet = await _get_or_create_wallet(user_id, db)
-        await _credit_wallet(
-            wallet_id=str(wallet["id"]),
-            amount=amount_naira,
-            description="Wallet top-up via Paystack",
-            reference=reference,
-            provider="paystack",
-            db=db,
+
+        # Lock and update wallet balance in place
+        bal_row = await db.execute(
+            text("SELECT balance FROM wallets WHERE id = CAST(:wid AS UUID) FOR UPDATE"),
+            {"wid": str(wallet["id"])},
         )
-        # Mark any pending tx for this reference as success
+        current = Decimal(str(bal_row.mappings().first()["balance"]))
+        new_balance = current + amount_naira
+
+        await db.execute(
+            text("""
+                UPDATE wallets
+                SET balance = :bal, total_earned = total_earned + :amt, updated_at = NOW()
+                WHERE id = CAST(:wid AS UUID)
+            """),
+            {"bal": str(new_balance), "amt": str(amount_naira), "wid": str(wallet["id"])},
+        )
+        # Update pending tx to success — no new insert
         await db.execute(
             text("""
                 UPDATE wallet_transactions
-                SET status = 'success', updated_at = NOW()
+                SET status = 'success', balance_before = :bb, balance_after = :ba, updated_at = NOW()
                 WHERE reference = :ref AND status = 'pending'
             """),
-            {"ref": reference},
+            {"bb": str(current), "ba": str(new_balance), "ref": reference},
         )
         await db.commit()
 
