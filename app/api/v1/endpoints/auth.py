@@ -47,6 +47,15 @@ async def register(data: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
     await db.flush()
 
+    # Auto-create wallet for every new user
+    from sqlalchemy import text as raw_sql
+    wallet_id = str(__import__('uuid').uuid4())
+    await db.execute(raw_sql("""
+        INSERT INTO wallets (id, user_id, balance, total_earned, total_withdrawn, total_spent, is_frozen, created_at, updated_at)
+        VALUES (CAST(:id AS UUID), CAST(:uid AS UUID), 0, 0, 0, 0, FALSE, NOW(), NOW())
+        ON CONFLICT (user_id) DO NOTHING
+    """), {"id": wallet_id, "uid": str(user.id)})
+
     # Generate tokens
     access_token = create_access_token(user.id, user.role.value)
     refresh_token = create_refresh_token(user.id)

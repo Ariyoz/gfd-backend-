@@ -235,7 +235,7 @@ async def fund_wallet(
               (id, wallet_id, type, amount, fee, description, reference, provider, status, created_at, updated_at)
             VALUES
               (gen_random_uuid(), CAST(:wid AS UUID), 'credit', :amount, 0,
-               'Wallet top-up', :ref, 'paystack', 'pending', NOW(), NOW())
+               'Wallet top-up', :ref, :prov, 'pending', NOW(), NOW())
         """),
         {
             "wid": str(wallet["id"]),
@@ -809,3 +809,399 @@ async def flutterwave_webhook(
             await db.commit()
 
     return {"status": "ok"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEND MONEY — user-to-user transfer
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/send")
+async def send_money(
+    payload: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Send money to another GFD user by username or email.
+    Atomic: debit sender + credit recipient in one transaction.
+    """
+    try:
+        recipient_id_or_username = payload.get("recipient")  # username or email
+        amount = Decimal(str(payload.get("amount", 0)))
+        note = payload.get("note", "")
+
+        if not recipient_id_or_username:
+            raise HTTPException(400, "recipient is required (username or email)")
+        if amount < Decimal("100"):
+            raise HTTPException(400, "Minimum transfer amount is ₦100")
+
+        # Find recipient
+        r = await db.execute(
+            text("SELECT * FROM users WHERE username = :q OR email = :q"),
+            {"q": recipient_id_or_username},
+        )
+        recipient = r.mappings().first()
+        if not recipient:
+            raise HTTPException(404, f"User '{recipient_id_or_username}' not found")
+        if str(recipient["id"]) == str(user.id):
+            raise HTTPException(400, "You cannot send money to yourself")
+
+        # Get sender wallet
+        sender_wallet = await _get_or_create_wallet(str(user.id), db)
+        if sender_wallet.get("is_frozen"):
+            raise HTTPException(403, "Your wallet is frozen. Contact support.")
+
+        sender_balance = Decimal(str(sender_wallet["balance"]))
+        if sender_balance < amount:
+            raise HTTPException(400, f"Insufficient balance. Have ₦{sender_balance:,.2f}, need ₦{amount:,.2f}")
+
+        # Get recipient wallet
+        recipient_wallet = await _get_or_create_wallet(str(recipient["id"]), db)
+
+        ref = f"TRF-{uuid.uuid4().hex[:14].upper()}"
+
+        # Debit sender (FOR UPDATE locks)
+        s_bal_row = await db.execute(
+            text("SELECT balance FROM wallets WHERE id = CAST(:wid AS UUID) FOR UPDATE"),
+            {"wid": str(sender_wallet["id"])},
+        )
+        s_balance = Decimal(str(s_bal_row.mappings().first()["balance"]))
+        if s_balance < amount:
+            raise HTTPException(400, "Insufficient balance")
+        s_new = s_balance - amount
+
+        await db.execute(
+            text("""
+                UPDATE wallets SET balance = :bal, total_spent = total_spent + :amt, updated_at = NOW()
+                WHERE id = CAST(:wid AS UUID)
+            """),
+            {"bal": str(s_new), "amt": str(amount), "wid": str(sender_wallet["id"])},
+        )
+        await db.execute(
+            text("""
+                INSERT INTO wallet_transactions
+                  (id, wallet_id, type, amount, fee, balance_before, balance_after,
+                   description, reference, provider, status, created_at, updated_at)
+                VALUES (gen_random_uuid(), CAST(:wid AS UUID), 'debit', :amt, 0,
+                        :bb, :ba, :desc, :ref, 'internal', 'success', NOW(), NOW())
+            """),
+            {
+                "wid": str(sender_wallet["id"]), "amt": str(amount),
+                "bb": str(s_balance), "ba": str(s_new),
+                "desc": f"Sent to @{recipient['username']}" + (f" — {note}" if note else ""),
+                "ref": ref,
+            },
+        )
+
+        # Credit recipient
+        r_bal_row = await db.execute(
+            text("SELECT balance FROM wallets WHERE id = CAST(:wid AS UUID) FOR UPDATE"),
+            {"wid": str(recipient_wallet["id"])},
+        )
+        r_balance = Decimal(str(r_bal_row.mappings().first()["balance"]))
+        r_new = r_balance + amount
+
+        await db.execute(
+            text("""
+                UPDATE wallets SET balance = :bal, total_earned = total_earned + :amt, updated_at = NOW()
+                WHERE id = CAST(:wid AS UUID)
+            """),
+            {"bal": str(r_new), "amt": str(amount), "wid": str(recipient_wallet["id"])},
+        )
+        await db.execute(
+            text("""
+                INSERT INTO wallet_transactions
+                  (id, wallet_id, type, amount, fee, balance_before, balance_after,
+                   description, reference, provider, status, created_at, updated_at)
+                VALUES (gen_random_uuid(), CAST(:wid AS UUID), 'credit', :amt, 0,
+                        :bb, :ba, :desc, :ref_in, 'internal', 'success', NOW(), NOW())
+            """),
+            {
+                "wid": str(recipient_wallet["id"]), "amt": str(amount),
+                "bb": str(r_balance), "ba": str(r_new),
+                "desc": f"Received from @{user.username}" + (f" — {note}" if note else ""),
+                "ref_in": f"{ref}-IN",
+            },
+        )
+
+        # Notify recipient
+        await db.execute(
+            text("""
+                INSERT INTO notifications (id, user_id, actor_id, type, title, body, action_url, created_at)
+                VALUES (gen_random_uuid(), CAST(:uid AS UUID), CAST(:actor AS UUID),
+                        'transfer_received', :title, :body, '/wallet', NOW())
+            """),
+            {
+                "uid": str(recipient["id"]), "actor": str(user.id),
+                "title": f"₦{amount:,.0f} received from @{user.username}",
+                "body": note or f"Money transfer from {user.full_name}",
+            },
+        )
+
+        await db.commit()
+
+        return {
+            "message": f"₦{amount:,.2f} sent to @{recipient['username']} successfully",
+            "reference": ref,
+            "amount": str(amount),
+            "recipient": {
+                "username": recipient["username"],
+                "full_name": recipient["full_name"],
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Transfer failed: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REQUEST MONEY — send a payment request to another user
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/request")
+async def request_money(
+    payload: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a money request to another GFD user."""
+    try:
+        recipient_username = payload.get("recipient")
+        amount = Decimal(str(payload.get("amount", 0)))
+        note = payload.get("note", "")
+
+        if not recipient_username:
+            raise HTTPException(400, "recipient is required")
+        if amount < Decimal("100"):
+            raise HTTPException(400, "Minimum request amount is ₦100")
+
+        r = await db.execute(
+            text("SELECT * FROM users WHERE username = :q OR email = :q"),
+            {"q": recipient_username},
+        )
+        recipient = r.mappings().first()
+        if not recipient:
+            raise HTTPException(404, f"User '{recipient_username}' not found")
+        if str(recipient["id"]) == str(user.id):
+            raise HTTPException(400, "Cannot request money from yourself")
+
+        req_id = str(uuid.uuid4())
+        await db.execute(
+            text("""
+                INSERT INTO money_requests
+                  (id, requester_id, payer_id, amount, note, status, created_at)
+                VALUES (CAST(:id AS UUID), CAST(:req AS UUID), CAST(:pay AS UUID), :amt, :note, 'pending', NOW())
+            """),
+            {
+                "id": req_id, "req": str(user.id),
+                "pay": str(recipient["id"]), "amt": str(amount), "note": note,
+            },
+        )
+
+        # Notify recipient
+        await db.execute(
+            text("""
+                INSERT INTO notifications (id, user_id, actor_id, type, title, body, action_url, created_at)
+                VALUES (gen_random_uuid(), CAST(:uid AS UUID), CAST(:actor AS UUID),
+                        'money_request', :title, :body, '/wallet', NOW())
+            """),
+            {
+                "uid": str(recipient["id"]), "actor": str(user.id),
+                "title": f"@{user.username} is requesting ₦{amount:,.0f}",
+                "body": note or f"Payment request from {user.full_name}",
+            },
+        )
+
+        await db.commit()
+        return {"message": "Request sent", "request_id": req_id, "amount": str(amount)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Request failed: {str(e)}")
+
+
+@router.get("/requests")
+async def get_money_requests(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get incoming and outgoing money requests."""
+    try:
+        r = await db.execute(
+            text("""
+                SELECT mr.*, 
+                       req.username AS requester_username, req.full_name AS requester_name, req.avatar AS requester_avatar,
+                       pay.username AS payer_username, pay.full_name AS payer_name
+                FROM money_requests mr
+                JOIN users req ON req.id = mr.requester_id
+                JOIN users pay ON pay.id = mr.payer_id
+                WHERE mr.requester_id = CAST(:uid AS UUID) OR mr.payer_id = CAST(:uid AS UUID)
+                ORDER BY mr.created_at DESC LIMIT 50
+            """),
+            {"uid": str(user.id)},
+        )
+        rows = r.mappings().all()
+        return {
+            "requests": [
+                {
+                    "id": str(row["id"]),
+                    "amount": str(row["amount"]),
+                    "note": row.get("note"),
+                    "status": row["status"],
+                    "is_incoming": str(row["payer_id"]) == str(user.id),
+                    "requester": {"username": row["requester_username"], "full_name": row["requester_name"], "avatar": row.get("requester_avatar")},
+                    "payer": {"username": row["payer_username"], "full_name": row["payer_name"]},
+                    "created_at": str(row["created_at"]),
+                }
+                for row in rows
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Error fetching requests: {str(e)}")
+
+
+@router.post("/requests/{request_id}/accept")
+async def accept_money_request(
+    request_id: str,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Accept a money request — transfers funds from payer to requester."""
+    try:
+        r = await db.execute(
+            text("SELECT * FROM money_requests WHERE id = CAST(:id AS UUID)"),
+            {"id": request_id},
+        )
+        req = r.mappings().first()
+        if not req:
+            raise HTTPException(404, "Request not found")
+        if str(req["payer_id"]) != str(user.id):
+            raise HTTPException(403, "This request is not for you")
+        if req["status"] != "pending":
+            raise HTTPException(400, f"Request is already {req['status']}")
+
+        amount = Decimal(str(req["amount"]))
+
+        # Get wallets
+        payer_wallet = await _get_or_create_wallet(str(user.id), db)
+        requester_wallet = await _get_or_create_wallet(str(req["requester_id"]), db)
+
+        payer_balance = Decimal(str(payer_wallet["balance"]))
+        if payer_balance < amount:
+            raise HTTPException(400, f"Insufficient balance. Have ₦{payer_balance:,.2f}, need ₦{amount:,.2f}")
+
+        ref = f"REQ-{uuid.uuid4().hex[:12].upper()}"
+
+        # Debit payer
+        p_bal_row = await db.execute(
+            text("SELECT balance FROM wallets WHERE id = CAST(:wid AS UUID) FOR UPDATE"),
+            {"wid": str(payer_wallet["id"])},
+        )
+        p_bal = Decimal(str(p_bal_row.mappings().first()["balance"]))
+        p_new = p_bal - amount
+
+        await db.execute(
+            text("UPDATE wallets SET balance = :b, total_spent = total_spent + :a, updated_at = NOW() WHERE id = CAST(:wid AS UUID)"),
+            {"b": str(p_new), "a": str(amount), "wid": str(payer_wallet["id"])},
+        )
+        await db.execute(
+            text("""
+                INSERT INTO wallet_transactions (id, wallet_id, type, amount, fee, balance_before, balance_after, description, reference, provider, status, created_at, updated_at)
+                VALUES (gen_random_uuid(), CAST(:wid AS UUID), 'debit', :a, 0, :bb, :ba, :desc, :ref, 'internal', 'success', NOW(), NOW())
+            """),
+            {"wid": str(payer_wallet["id"]), "a": str(amount), "bb": str(p_bal), "ba": str(p_new),
+             "desc": f"Request paid to @{req['requester_id']}" + (f" — {req.get('note','')}" if req.get('note') else ""),
+             "ref": ref},
+        )
+
+        # Credit requester
+        rq_bal_row = await db.execute(
+            text("SELECT balance FROM wallets WHERE id = CAST(:wid AS UUID) FOR UPDATE"),
+            {"wid": str(requester_wallet["id"])},
+        )
+        rq_bal = Decimal(str(rq_bal_row.mappings().first()["balance"]))
+        rq_new = rq_bal + amount
+
+        await db.execute(
+            text("UPDATE wallets SET balance = :b, total_earned = total_earned + :a, updated_at = NOW() WHERE id = CAST(:wid AS UUID)"),
+            {"b": str(rq_new), "a": str(amount), "wid": str(requester_wallet["id"])},
+        )
+        await db.execute(
+            text("""
+                INSERT INTO wallet_transactions (id, wallet_id, type, amount, fee, balance_before, balance_after, description, reference, provider, status, created_at, updated_at)
+                VALUES (gen_random_uuid(), CAST(:wid AS UUID), 'credit', :a, 0, :bb, :ba, :desc, :ref, 'internal', 'success', NOW(), NOW())
+            """),
+            {"wid": str(requester_wallet["id"]), "a": str(amount), "bb": str(rq_bal), "ba": str(rq_new),
+             "desc": f"Request accepted by @{user.username}", "ref": f"{ref}-IN"},
+        )
+
+        # Update request status
+        await db.execute(
+            text("UPDATE money_requests SET status = 'accepted' WHERE id = CAST(:id AS UUID)"),
+            {"id": request_id},
+        )
+
+        # Notify requester
+        await db.execute(
+            text("""
+                INSERT INTO notifications (id, user_id, actor_id, type, title, body, action_url, created_at)
+                VALUES (gen_random_uuid(), CAST(:uid AS UUID), CAST(:actor AS UUID), 'request_accepted',
+                        :title, :body, '/wallet', NOW())
+            """),
+            {"uid": str(req["requester_id"]), "actor": str(user.id),
+             "title": f"@{user.username} accepted your payment request",
+             "body": f"₦{amount:,.0f} has been added to your wallet"},
+        )
+
+        await db.commit()
+        return {"message": f"₦{amount:,.2f} transferred successfully", "reference": ref}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Accept failed: {str(e)}")
+
+
+@router.post("/requests/{request_id}/reject")
+async def reject_money_request(
+    request_id: str,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reject a money request."""
+    try:
+        r = await db.execute(
+            text("SELECT * FROM money_requests WHERE id = CAST(:id AS UUID)"),
+            {"id": request_id},
+        )
+        req = r.mappings().first()
+        if not req:
+            raise HTTPException(404, "Request not found")
+        if str(req["payer_id"]) != str(user.id):
+            raise HTTPException(403, "This request is not for you")
+        if req["status"] != "pending":
+            raise HTTPException(400, f"Request is already {req['status']}")
+
+        await db.execute(
+            text("UPDATE money_requests SET status = 'rejected' WHERE id = CAST(:id AS UUID)"),
+            {"id": request_id},
+        )
+
+        # Notify requester
+        await db.execute(
+            text("""
+                INSERT INTO notifications (id, user_id, actor_id, type, title, body, action_url, created_at)
+                VALUES (gen_random_uuid(), CAST(:uid AS UUID), CAST(:actor AS UUID), 'request_rejected',
+                        :title, :body, '/wallet', NOW())
+            """),
+            {"uid": str(req["requester_id"]), "actor": str(user.id),
+             "title": f"@{user.username} declined your payment request",
+             "body": f"Your request for ₦{req['amount']:,.0f} was declined"},
+        )
+
+        await db.commit()
+        return {"message": "Request rejected"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Reject failed: {str(e)}")

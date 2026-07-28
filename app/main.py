@@ -187,6 +187,20 @@ async def lifespan(app: FastAPI):
                 CREATE INDEX IF NOT EXISTS idx_wr_user ON withdrawal_requests(user_id);
                 CREATE INDEX IF NOT EXISTS idx_wr_status ON withdrawal_requests(status);
             """))
+            # money_requests table for send/request money feature
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS money_requests (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    requester_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    payer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    amount NUMERIC(12,2) NOT NULL,
+                    note TEXT,
+                    status VARCHAR(20) DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_mr_payer ON money_requests(payer_id);
+                CREATE INDEX IF NOT EXISTS idx_mr_requester ON money_requests(requester_id);
+            """))
             # Step 2: Add missing columns using ADD COLUMN IF NOT EXISTS (PostgreSQL 9.6+)
             await conn.execute(text("""
                 ALTER TABLE wallets ADD COLUMN IF NOT EXISTS total_spent NUMERIC(12,2) DEFAULT 0;
