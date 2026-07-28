@@ -207,28 +207,50 @@ async def fund_wallet(
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Initiate a wallet top-up via Paystack or Flutterwave.
-    Returns a payment URL the frontend should redirect to.
-    """
+    """Initiate a Paystack wallet top-up. Returns payment_url to redirect the user to."""
+    import logging
+    log = logging.getLogger("gfd.wallet")
+
     wallet = await _get_or_create_wallet(str(user.id), db)
 
     if wallet.get("is_frozen"):
         raise HTTPException(status_code=403, detail="Wallet is frozen. Contact support.")
 
+    # Clean up any stale pending fund transactions older than 1 hour for this wallet
+    # so they don't accumulate and clutter the tx history
+    await db.execute(
+        text("""
+            DELETE FROM wallet_transactions
+            WHERE wallet_id = CAST(:wid AS UUID)
+              AND type = 'credit'
+              AND status = 'pending'
+              AND created_at < NOW() - INTERVAL '1 hour'
+        """),
+        {"wid": str(wallet["id"])},
+    )
+
     try:
         from app.integrations.paystack_service import initialize_payment, generate_reference
         reference = generate_reference()
+        log.info(f"[Fund] user={user.id} amount=₦{payload.amount} ref={reference}")
         result = await initialize_payment(
             email=user.email,
             amount_naira=payload.amount,
             reference=reference,
-            metadata={"user_id": str(user.id), "wallet_id": str(wallet["id"]), "type": "wallet_fund"},
+            metadata={
+                "user_id": str(user.id),
+                "wallet_id": str(wallet["id"]),
+                "type": "wallet_fund",
+            },
         )
+    except ValueError as e:
+        log.error(f"[Fund] Paystack init failed for user={user.id}: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
+        log.error(f"[Fund] Unexpected error for user={user.id}: {e}")
         raise HTTPException(status_code=502, detail=f"Payment provider error: {str(e)}")
 
-    # Record a PENDING transaction so we can match the webhook/verify call
+    # Record PENDING transaction — will be updated to success on verify/webhook
     await db.execute(
         text("""
             INSERT INTO wallet_transactions
@@ -246,6 +268,7 @@ async def fund_wallet(
     )
     await db.commit()
 
+    log.info(f"[Fund] Pending tx created: user={user.id} ref={reference}")
     return {
         "payment_url": result["payment_url"],
         "reference": reference,
@@ -261,10 +284,14 @@ async def verify_payment(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Verify a payment by reference and credit the wallet if successful.
-    Call this after the user returns from the payment page.
+    Verify a Paystack payment by reference and credit the wallet if successful.
+    Called after user returns from Paystack checkout page.
     """
-    # Check if already processed
+    import logging
+    log = logging.getLogger("gfd.wallet")
+    log.info(f"[Verify] user={user.id} ref={payload.reference}")
+
+    # Check if already processed (idempotency)
     existing = await db.execute(
         text("""
             SELECT wt.id, wt.status, wt.amount, w.user_id
@@ -277,35 +304,36 @@ async def verify_payment(
     tx_row = existing.mappings().first()
 
     if not tx_row:
+        log.warning(f"[Verify] Reference not found: {payload.reference}")
         raise HTTPException(status_code=404, detail="Transaction reference not found")
 
     if str(tx_row["user_id"]) != str(user.id):
+        log.warning(f"[Verify] User mismatch: ref={payload.reference} tx_user={tx_row['user_id']} req_user={user.id}")
         raise HTTPException(status_code=403, detail="Transaction does not belong to you")
 
     if tx_row["status"] == "success":
-        return {"message": "Already credited", "status": "success", "amount": tx_row["amount"]}
+        log.info(f"[Verify] Already credited: ref={payload.reference}")
+        return {"message": "Already credited", "status": "success", "amount": str(tx_row["amount"])}
 
-    # Verify with provider
-    if payload.provider == "paystack":
-        from app.integrations.paystack_service import verify_payment as pstack_verify
-        result = await pstack_verify(payload.reference)
-    else:
-        from app.integrations.flutterwave_service import verify_payment as flw_verify
-        result = await flw_verify(payload.reference)
+    # Verify with Paystack
+    from app.integrations.paystack_service import verify_payment as pstack_verify
+    result = await pstack_verify(payload.reference)
 
     if not result["success"]:
+        log.warning(f"[Verify] Paystack says not successful: ref={payload.reference} status={result.get('status')}")
         await db.execute(
             text("UPDATE wallet_transactions SET status = 'failed', updated_at = NOW() WHERE reference = :ref"),
             {"ref": payload.reference},
         )
         await db.commit()
-        raise HTTPException(status_code=402, detail="Payment not completed or failed")
+        raise HTTPException(status_code=402, detail="Payment not completed or failed on Paystack")
 
-    # Credit the wallet — update existing pending tx in place (avoids UNIQUE reference clash)
-    wallet = await _get_or_create_wallet(str(user.id), db)
     amount = Decimal(str(result["amount_naira"]))
+    log.info(f"[Verify] Payment confirmed: ref={payload.reference} amount=₦{amount}")
 
-    # Lock wallet row and get current balance
+    # Credit wallet atomically — update the pending tx in-place (no new insert, avoids UNIQUE clash)
+    wallet = await _get_or_create_wallet(str(user.id), db)
+
     bal_row = await db.execute(
         text("SELECT balance FROM wallets WHERE id = CAST(:wid AS UUID) FOR UPDATE"),
         {"wid": str(wallet["id"])},
@@ -313,7 +341,6 @@ async def verify_payment(
     current = Decimal(str(bal_row.mappings().first()["balance"]))
     new_balance = current + amount
 
-    # Update wallet balance
     await db.execute(
         text("""
             UPDATE wallets
@@ -322,21 +349,21 @@ async def verify_payment(
         """),
         {"bal": str(new_balance), "amt": str(amount), "wid": str(wallet["id"])},
     )
-
-    # Update the pending tx to success — no new insert, avoids UNIQUE constraint on reference
     await db.execute(
         text("""
             UPDATE wallet_transactions
-            SET status        = 'success',
+            SET status         = 'success',
                 balance_before = :bb,
                 balance_after  = :ba,
-                updated_at    = NOW()
-            WHERE reference = :ref AND status = 'pending'
+                description    = 'Wallet top-up via Paystack',
+                updated_at     = NOW()
+            WHERE reference = :ref
         """),
         {"bb": str(current), "ba": str(new_balance), "ref": payload.reference},
     )
     await db.commit()
 
+    log.info(f"[Verify] Wallet credited: user={user.id} amount=₦{amount} new_balance=₦{new_balance}")
     return {
         "message": "Wallet credited successfully",
         "amount": str(amount),
@@ -626,47 +653,56 @@ async def paystack_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Handle Paystack webhook events."""
-    from app.integrations.paystack_service import verify_webhook_signature
+    """Handle Paystack webhook events. Must return 200 quickly."""
+    import logging
+    log = logging.getLogger("gfd.webhook")
 
     body = await request.body()
     signature = request.headers.get("x-paystack-signature", "")
 
+    from app.integrations.paystack_service import verify_webhook_signature
     if not verify_webhook_signature(body, signature):
-        raise HTTPException(status_code=400, detail="Invalid signature")
+        log.warning(f"[Webhook] Invalid signature — rejected")
+        # Return 200 anyway so Paystack doesn't keep retrying with bad sig
+        return {"status": "invalid_signature"}
 
     try:
         event = json.loads(body)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        return {"status": "invalid_json"}
 
-    event_type = event.get("event")
+    event_type = event.get("event", "")
     data = event.get("data", {})
+    log.info(f"[Webhook] Received: {event_type}")
 
-    # ── Charge success (manual payment or card) ──
     if event_type == "charge.success":
         reference = data.get("reference", "")
         amount_naira = Decimal(str(data.get("amount", 0))) / 100
-        metadata = data.get("metadata", {})
+        metadata = data.get("metadata") or {}
         user_id = metadata.get("user_id")
 
-        if not user_id or not reference:
-            return {"status": "ignored"}
+        log.info(f"[Webhook] charge.success: ref={reference} amount=₦{amount_naira} user_id={user_id}")
 
-        # Avoid double-crediting
+        if not reference:
+            return {"status": "ignored", "reason": "no reference"}
+        if not user_id:
+            log.warning(f"[Webhook] charge.success: no user_id in metadata for ref={reference}")
+            return {"status": "ignored", "reason": "no user_id in metadata"}
+
+        # Idempotency check — never double-credit
         dup = await db.execute(
             text("""
                 SELECT id FROM wallet_transactions
-                WHERE reference = :ref AND status = 'success' AND type = 'credit'
+                WHERE reference = :ref AND status = 'success'
             """),
             {"ref": reference},
         )
         if dup.mappings().first():
+            log.info(f"[Webhook] Already processed: ref={reference}")
             return {"status": "already_processed"}
 
         wallet = await _get_or_create_wallet(user_id, db)
 
-        # Lock and update wallet balance in place
         bal_row = await db.execute(
             text("SELECT balance FROM wallets WHERE id = CAST(:wid AS UUID) FOR UPDATE"),
             {"wid": str(wallet["id"])},
@@ -682,20 +718,38 @@ async def paystack_webhook(
             """),
             {"bal": str(new_balance), "amt": str(amount_naira), "wid": str(wallet["id"])},
         )
-        # Update pending tx to success — no new insert
-        await db.execute(
+
+        # Update pending tx if it exists, otherwise insert a new one (handles webhook arriving before verify)
+        updated = await db.execute(
             text("""
                 UPDATE wallet_transactions
-                SET status = 'success', balance_before = :bb, balance_after = :ba, updated_at = NOW()
-                WHERE reference = :ref AND status = 'pending'
+                SET status = 'success', balance_before = :bb, balance_after = :ba,
+                    description = 'Wallet top-up via Paystack', updated_at = NOW()
+                WHERE reference = :ref
+                RETURNING id
             """),
             {"bb": str(current), "ba": str(new_balance), "ref": reference},
         )
-        await db.commit()
+        if not updated.fetchone():
+            # No pending tx found — insert fresh success record
+            await db.execute(
+                text("""
+                    INSERT INTO wallet_transactions
+                      (id, wallet_id, type, amount, fee, balance_before, balance_after,
+                       description, reference, provider, status, created_at, updated_at)
+                    VALUES
+                      (gen_random_uuid(), CAST(:wid AS UUID), 'credit', :amt, 0,
+                       :bb, :ba, 'Wallet top-up via Paystack', :ref, 'paystack', 'success', NOW(), NOW())
+                    ON CONFLICT (reference) DO NOTHING
+                """),
+                {
+                    "wid": str(wallet["id"]), "amt": str(amount_naira),
+                    "bb": str(current), "ba": str(new_balance), "ref": reference,
+                },
+            )
 
-    # ── DVA credit (dedicated virtual account) ──
-    elif event_type == "dedicatedaccount.assign.success":
-        pass  # DVA setup confirmation — no action needed
+        await db.commit()
+        log.info(f"[Webhook] Wallet credited: user={user_id} amount=₦{amount_naira} new_balance=₦{new_balance}")
 
     elif event_type in ("transfer.success", "transfer.failed", "transfer.reversed"):
         reference = data.get("reference", "")
@@ -704,22 +758,14 @@ async def paystack_webhook(
             "transfer.failed": "failed",
             "transfer.reversed": "reversed",
         }[event_type]
-
+        log.info(f"[Webhook] {event_type}: ref={reference} → {new_status}")
         if reference:
             await db.execute(
-                text("""
-                    UPDATE withdrawal_requests
-                    SET status = :s, updated_at = NOW()
-                    WHERE reference = :ref
-                """),
+                text("UPDATE withdrawal_requests SET status = :s, updated_at = NOW() WHERE reference = :ref"),
                 {"s": new_status, "ref": reference},
             )
             await db.execute(
-                text("""
-                    UPDATE wallet_transactions
-                    SET status = :s, updated_at = NOW()
-                    WHERE reference = :ref AND type = 'withdrawal'
-                """),
+                text("UPDATE wallet_transactions SET status = :s, updated_at = NOW() WHERE reference = :ref AND type = 'withdrawal'"),
                 {"s": new_status, "ref": reference},
             )
             await db.commit()
