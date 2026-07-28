@@ -110,6 +110,20 @@ async def _credit_wallet(wallet_id: str, amount: Decimal, description: str,
 # Endpoints
 # ══════════════════════════════════════════════════════════════════════════════
 
+@router.get("/debug")
+async def wallet_debug(user: User = Depends(get_current_active_user)):
+    """Debug endpoint — shows Paystack config state (key masked)."""
+    from app.config import get_settings as gs
+    s = gs()
+    key = s.PAYSTACK_SECRET_KEY
+    return {
+        "paystack_key_set": bool(key),
+        "paystack_key_prefix": key[:12] + "..." if key else "EMPTY",
+        "frontend_url": s.FRONTEND_URL,
+        "user_email": user.email,
+    }
+
+
 @router.get("", response_model=WalletResponse)
 @router.get("/", response_model=WalletResponse)
 async def get_wallet(
@@ -211,28 +225,28 @@ async def fund_wallet(
     import logging
     log = logging.getLogger("gfd.wallet")
 
-    wallet = await _get_or_create_wallet(str(user.id), db)
-
-    if wallet.get("is_frozen"):
-        raise HTTPException(status_code=403, detail="Wallet is frozen. Contact support.")
-
-    # Clean up any stale pending fund transactions older than 1 hour for this wallet
-    # so they don't accumulate and clutter the tx history
-    await db.execute(
-        text("""
-            DELETE FROM wallet_transactions
-            WHERE wallet_id = CAST(:wid AS UUID)
-              AND type = 'credit'
-              AND status = 'pending'
-              AND created_at < NOW() - INTERVAL '1 hour'
-        """),
-        {"wid": str(wallet["id"])},
-    )
-
     try:
+        wallet = await _get_or_create_wallet(str(user.id), db)
+
+        if wallet.get("is_frozen"):
+            raise HTTPException(status_code=403, detail="Wallet is frozen. Contact support.")
+
+        # Clean up stale pending fund transactions older than 1 hour
+        await db.execute(
+            text("""
+                DELETE FROM wallet_transactions
+                WHERE wallet_id = CAST(:wid AS UUID)
+                  AND type = 'credit'
+                  AND status = 'pending'
+                  AND created_at < NOW() - INTERVAL '1 hour'
+            """),
+            {"wid": str(wallet["id"])},
+        )
+
         from app.integrations.paystack_service import initialize_payment, generate_reference
         reference = generate_reference()
         log.info(f"[Fund] user={user.id} amount=₦{payload.amount} ref={reference}")
+
         result = await initialize_payment(
             email=user.email,
             amount_naira=payload.amount,
@@ -243,38 +257,42 @@ async def fund_wallet(
                 "type": "wallet_fund",
             },
         )
+
+        # Record PENDING transaction
+        await db.execute(
+            text("""
+                INSERT INTO wallet_transactions
+                  (id, wallet_id, type, amount, fee, description, reference, provider, status, created_at, updated_at)
+                VALUES
+                  (gen_random_uuid(), CAST(:wid AS UUID), 'credit', :amount, 0,
+                   'Wallet top-up', :ref, :prov, 'pending', NOW(), NOW())
+            """),
+            {
+                "wid": str(wallet["id"]),
+                "amount": str(payload.amount),
+                "ref": reference,
+                "prov": "paystack",
+            },
+        )
+        await db.commit()
+
+        log.info(f"[Fund] Success: ref={reference} url={result['payment_url'][:60]}")
+        return {
+            "payment_url": result["payment_url"],
+            "reference": reference,
+            "amount": payload.amount,
+            "provider": "paystack",
+        }
+
+    except HTTPException:
+        raise
     except ValueError as e:
-        log.error(f"[Fund] Paystack init failed for user={user.id}: {e}")
+        log.error(f"[Fund] ValueError for user={user.id}: {e}")
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
-        log.error(f"[Fund] Unexpected error for user={user.id}: {e}")
-        raise HTTPException(status_code=502, detail=f"Payment provider error: {str(e)}")
-
-    # Record PENDING transaction — will be updated to success on verify/webhook
-    await db.execute(
-        text("""
-            INSERT INTO wallet_transactions
-              (id, wallet_id, type, amount, fee, description, reference, provider, status, created_at, updated_at)
-            VALUES
-              (gen_random_uuid(), CAST(:wid AS UUID), 'credit', :amount, 0,
-               'Wallet top-up', :ref, :prov, 'pending', NOW(), NOW())
-        """),
-        {
-            "wid": str(wallet["id"]),
-            "amount": str(payload.amount),
-            "ref": reference,
-            "prov": "paystack",
-        },
-    )
-    await db.commit()
-
-    log.info(f"[Fund] Pending tx created: user={user.id} ref={reference}")
-    return {
-        "payment_url": result["payment_url"],
-        "reference": reference,
-        "amount": payload.amount,
-        "provider": "paystack",
-    }
+        import traceback
+        log.error(f"[Fund] Unexpected error for user={user.id}: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Fund error: {str(e)}")
 
 
 @router.post("/verify")
