@@ -643,10 +643,100 @@ async def diag():
         "frontend_url": s.FRONTEND_URL,
         "db_check": {},
         "insert_test": None,
+        "create_attempt": None,
     }
 
     try:
         async with AsyncSessionLocal() as db:
+            # Try to create tables directly if they don't exist
+            try:
+                await db.execute(t("""
+                    CREATE TABLE IF NOT EXISTS wallets (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                        balance NUMERIC(12,2) DEFAULT 0 NOT NULL,
+                        total_earned NUMERIC(12,2) DEFAULT 0 NOT NULL,
+                        total_withdrawn NUMERIC(12,2) DEFAULT 0 NOT NULL,
+                        total_spent NUMERIC(12,2) DEFAULT 0 NOT NULL,
+                        is_frozen BOOLEAN DEFAULT FALSE NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """))
+                await db.execute(t("""
+                    CREATE TABLE IF NOT EXISTS wallet_transactions (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+                        type VARCHAR(20) NOT NULL,
+                        amount NUMERIC(12,2) NOT NULL,
+                        fee NUMERIC(12,2) DEFAULT 0,
+                        balance_before NUMERIC(12,2),
+                        balance_after NUMERIC(12,2),
+                        description TEXT,
+                        reference VARCHAR(100) UNIQUE,
+                        provider VARCHAR(30),
+                        status VARCHAR(20) DEFAULT 'pending' NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """))
+                await db.execute(t("""
+                    CREATE TABLE IF NOT EXISTS virtual_accounts (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                        bank_name VARCHAR(100),
+                        account_name VARCHAR(200),
+                        account_number VARCHAR(20),
+                        provider VARCHAR(50),
+                        customer_code VARCHAR(100),
+                        dva_id VARCHAR(100),
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """))
+                await db.execute(t("""
+                    CREATE TABLE IF NOT EXISTS withdrawal_requests (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+                        amount NUMERIC(12,2) NOT NULL,
+                        fee NUMERIC(12,2) DEFAULT 0,
+                        net_amount NUMERIC(12,2) NOT NULL,
+                        bank_name VARCHAR(100) NOT NULL,
+                        account_name VARCHAR(200) NOT NULL,
+                        account_number VARCHAR(20) NOT NULL,
+                        bank_code VARCHAR(20),
+                        status VARCHAR(20) DEFAULT 'pending' NOT NULL,
+                        reference VARCHAR(100) UNIQUE,
+                        provider VARCHAR(30),
+                        rejection_reason TEXT,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """))
+                await db.execute(t("""
+                    CREATE TABLE IF NOT EXISTS money_requests (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        requester_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        payer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        amount NUMERIC(12,2) NOT NULL,
+                        note TEXT,
+                        status VARCHAR(20) DEFAULT 'pending' NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """))
+                await db.execute(t("CREATE INDEX IF NOT EXISTS idx_wt_wallet ON wallet_transactions(wallet_id)"))
+                await db.execute(t("CREATE INDEX IF NOT EXISTS idx_wt_ref ON wallet_transactions(reference)"))
+                await db.execute(t("CREATE INDEX IF NOT EXISTS idx_wt_status ON wallet_transactions(status)"))
+                await db.execute(t("CREATE INDEX IF NOT EXISTS idx_va_user ON virtual_accounts(user_id)"))
+                await db.execute(t("CREATE INDEX IF NOT EXISTS idx_wr_user ON withdrawal_requests(user_id)"))
+                await db.commit()
+                result["create_attempt"] = "OK — tables created/verified"
+            except Exception as ce:
+                await db.rollback()
+                result["create_attempt"] = f"FAILED: {str(ce)}"
+
             # Check wallet_transactions columns
             r = await db.execute(t(
                 "SELECT column_name FROM information_schema.columns "
@@ -660,7 +750,7 @@ async def diag():
             ))
             result["db_check"]["wallets_cols"] = [row[0] for row in r2.fetchall()]
 
-            # Try a test INSERT with the exact SQL the fund endpoint uses
+            # Test INSERT
             try:
                 await db.execute(t("""
                     INSERT INTO wallet_transactions
