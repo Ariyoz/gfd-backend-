@@ -295,6 +295,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ Migration check: {e}")
 
+    # ── Extend notificationtype enum with new values ──
+    try:
+        from app.database.session import engine
+        from sqlalchemy import text as _t
+        async with engine.begin() as conn:
+            for val in ('transfer_received', 'money_request', 'request_accepted',
+                        'request_rejected', 'hire_request', 'job_invite'):
+                await conn.execute(_t(
+                    f"ALTER TYPE notificationtype ADD VALUE IF NOT EXISTS '{val}'"
+                ))
+        print("✅ Notification enum extended")
+    except Exception as e:
+        print(f"⚠️ Notification enum migration: {e}")
+
     # ── Wallet tables — run in a completely separate block so they ALWAYS execute ──
     try:
         from app.database.session import engine

@@ -988,19 +988,22 @@ async def send_money(
             },
         )
 
-        # Notify recipient
-        await db.execute(
-            text("""
-                INSERT INTO notifications (id, user_id, actor_id, type, title, body, action_url, created_at)
-                VALUES (gen_random_uuid(), CAST(:uid AS UUID), CAST(:actor AS UUID),
-                        'transfer_received', :title, :body, '/wallet', NOW())
-            """),
-            {
-                "uid": str(recipient["id"]), "actor": str(user.id),
-                "title": f"₦{amount:,.0f} received from @{user.username}",
-                "body": note or f"Money transfer from {user.full_name}",
-            },
-        )
+        # Notify recipient (non-fatal — transfer is already committed)
+        try:
+            await db.execute(
+                text("""
+                    INSERT INTO notifications (id, user_id, actor_id, type, title, body, action_url, created_at)
+                    VALUES (gen_random_uuid(), CAST(:uid AS UUID), CAST(:actor AS UUID),
+                            'transfer_received', :title, :body, '/wallet', NOW())
+                """),
+                {
+                    "uid": str(recipient["id"]), "actor": str(user.id),
+                    "title": f"₦{amount:,.0f} received from @{user.username}",
+                    "body": note or f"Money transfer from {user.full_name}",
+                },
+            )
+        except Exception:
+            pass  # notification failure must never roll back the transfer
 
         await db.commit()
 
@@ -1063,19 +1066,22 @@ async def request_money(
             },
         )
 
-        # Notify recipient
-        await db.execute(
-            text("""
-                INSERT INTO notifications (id, user_id, actor_id, type, title, body, action_url, created_at)
-                VALUES (gen_random_uuid(), CAST(:uid AS UUID), CAST(:actor AS UUID),
-                        'money_request', :title, :body, '/wallet', NOW())
-            """),
-            {
-                "uid": str(recipient["id"]), "actor": str(user.id),
-                "title": f"@{user.username} is requesting ₦{amount:,.0f}",
-                "body": note or f"Payment request from {user.full_name}",
-            },
-        )
+        # Notify recipient (non-fatal)
+        try:
+            await db.execute(
+                text("""
+                    INSERT INTO notifications (id, user_id, actor_id, type, title, body, action_url, created_at)
+                    VALUES (gen_random_uuid(), CAST(:uid AS UUID), CAST(:actor AS UUID),
+                            'money_request', :title, :body, '/wallet', NOW())
+                """),
+                {
+                    "uid": str(recipient["id"]), "actor": str(user.id),
+                    "title": f"@{user.username} is requesting ₦{amount:,.0f}",
+                    "body": note or f"Payment request from {user.full_name}",
+                },
+            )
+        except Exception:
+            pass
 
         await db.commit()
         return {"message": "Request sent", "request_id": req_id, "amount": str(amount)}

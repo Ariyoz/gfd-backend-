@@ -20,6 +20,12 @@ class NotificationType(str, enum.Enum):
     PROJECT_UPDATE = "project_update"
     SYSTEM = "system"
     ADMIN_ALERT = "admin_alert"
+    TRANSFER_RECEIVED = "transfer_received"
+    MONEY_REQUEST = "money_request"
+    REQUEST_ACCEPTED = "request_accepted"
+    REQUEST_REJECTED = "request_rejected"
+    HIRE_REQUEST = "hire_request"
+    JOB_INVITE = "job_invite"
 
 
 class Notification(BaseModel):
