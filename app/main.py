@@ -295,6 +295,118 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ Migration check: {e}")
 
+    # ── Wallet tables — run in a completely separate block so they ALWAYS execute ──
+    try:
+        from app.database.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            print("🔧 Creating wallet tables...")
+            await conn.execute(_text("""
+                CREATE TABLE IF NOT EXISTS wallets (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                    balance NUMERIC(12,2) DEFAULT 0 NOT NULL,
+                    total_earned NUMERIC(12,2) DEFAULT 0 NOT NULL,
+                    total_withdrawn NUMERIC(12,2) DEFAULT 0 NOT NULL,
+                    total_spent NUMERIC(12,2) DEFAULT 0 NOT NULL,
+                    is_frozen BOOLEAN DEFAULT FALSE NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """))
+            await conn.execute(_text("""
+                CREATE TABLE IF NOT EXISTS wallet_transactions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+                    type VARCHAR(20) NOT NULL,
+                    amount NUMERIC(12,2) NOT NULL,
+                    fee NUMERIC(12,2) DEFAULT 0,
+                    balance_before NUMERIC(12,2),
+                    balance_after NUMERIC(12,2),
+                    description TEXT,
+                    reference VARCHAR(100) UNIQUE,
+                    provider VARCHAR(30),
+                    status VARCHAR(20) DEFAULT 'pending' NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """))
+            await conn.execute(_text("""
+                CREATE TABLE IF NOT EXISTS virtual_accounts (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                    bank_name VARCHAR(100),
+                    account_name VARCHAR(200),
+                    account_number VARCHAR(20),
+                    provider VARCHAR(50),
+                    customer_code VARCHAR(100),
+                    dva_id VARCHAR(100),
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """))
+            await conn.execute(_text("""
+                CREATE TABLE IF NOT EXISTS withdrawal_requests (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+                    amount NUMERIC(12,2) NOT NULL,
+                    fee NUMERIC(12,2) DEFAULT 0,
+                    net_amount NUMERIC(12,2) NOT NULL,
+                    bank_name VARCHAR(100) NOT NULL,
+                    account_name VARCHAR(200) NOT NULL,
+                    account_number VARCHAR(20) NOT NULL,
+                    bank_code VARCHAR(20),
+                    status VARCHAR(20) DEFAULT 'pending' NOT NULL,
+                    reference VARCHAR(100) UNIQUE,
+                    provider VARCHAR(30),
+                    rejection_reason TEXT,
+                    processed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """))
+            await conn.execute(_text("""
+                CREATE TABLE IF NOT EXISTS money_requests (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    requester_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    payer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    amount NUMERIC(12,2) NOT NULL,
+                    note TEXT,
+                    status VARCHAR(20) DEFAULT 'pending' NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """))
+            # Indexes
+            await conn.execute(_text("""
+                CREATE INDEX IF NOT EXISTS idx_wt_wallet    ON wallet_transactions(wallet_id);
+                CREATE INDEX IF NOT EXISTS idx_wt_reference ON wallet_transactions(reference);
+                CREATE INDEX IF NOT EXISTS idx_wt_status    ON wallet_transactions(status);
+                CREATE INDEX IF NOT EXISTS idx_va_user      ON virtual_accounts(user_id);
+                CREATE INDEX IF NOT EXISTS idx_wr_user      ON withdrawal_requests(user_id);
+                CREATE INDEX IF NOT EXISTS idx_wr_status    ON withdrawal_requests(status);
+                CREATE INDEX IF NOT EXISTS idx_mr_payer     ON money_requests(payer_id);
+                CREATE INDEX IF NOT EXISTS idx_mr_requester ON money_requests(requester_id);
+            """))
+            # Backfill any missing columns on existing tables
+            await conn.execute(_text("""
+                ALTER TABLE wallets ADD COLUMN IF NOT EXISTS total_spent NUMERIC(12,2) DEFAULT 0;
+                ALTER TABLE wallets ADD COLUMN IF NOT EXISTS is_frozen BOOLEAN DEFAULT FALSE;
+                ALTER TABLE wallets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+                ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS fee NUMERIC(12,2) DEFAULT 0;
+                ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS balance_before NUMERIC(12,2);
+                ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS balance_after NUMERIC(12,2);
+                ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS provider VARCHAR(30);
+                ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+                ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS dva_id VARCHAR(100);
+                ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
+                ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+            """))
+        print("✅ Wallet tables ready")
+    except Exception as e:
+        print(f"❌ Wallet table migration failed: {e}")
+
     # ── Keep-alive: ping self every 10 min so Render free tier stays warm ──
     import asyncio
     import httpx
