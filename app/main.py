@@ -517,6 +517,58 @@ async def health_check():
     return {"status": "healthy", "version": settings.APP_VERSION}
 
 
+# ── Server-side diagnostic — checks DB schema + Paystack key ──
+@app.get("/diag")
+async def diag():
+    from app.config import get_settings as gs
+    from app.database.session import AsyncSessionLocal
+    from sqlalchemy import text as t
+    s = gs()
+
+    result = {
+        "paystack_key_set": bool(s.PAYSTACK_SECRET_KEY),
+        "paystack_key_prefix": (s.PAYSTACK_SECRET_KEY[:10] + "...") if s.PAYSTACK_SECRET_KEY else "EMPTY",
+        "frontend_url": s.FRONTEND_URL,
+        "db_check": {},
+        "insert_test": None,
+    }
+
+    try:
+        async with AsyncSessionLocal() as db:
+            # Check wallet_transactions columns
+            r = await db.execute(t(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='wallet_transactions' ORDER BY ordinal_position"
+            ))
+            result["db_check"]["wallet_transactions_cols"] = [row[0] for row in r.fetchall()]
+
+            r2 = await db.execute(t(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='wallets' ORDER BY ordinal_position"
+            ))
+            result["db_check"]["wallets_cols"] = [row[0] for row in r2.fetchall()]
+
+            # Try a test INSERT with the exact SQL the fund endpoint uses
+            try:
+                await db.execute(t("""
+                    INSERT INTO wallet_transactions
+                      (id, wallet_id, type, amount, fee, description, reference, provider, status, created_at, updated_at)
+                    VALUES
+                      (gen_random_uuid(), gen_random_uuid(), 'credit', 1, 0,
+                       'diag-test', 'DIAG-REF-001', 'paystack', 'pending', NOW(), NOW())
+                """))
+                await db.rollback()
+                result["insert_test"] = "OK"
+            except Exception as e:
+                await db.rollback()
+                result["insert_test"] = f"FAILED: {str(e)}"
+
+    except Exception as e:
+        result["db_check"]["error"] = str(e)
+
+    return result
+
+
 @app.get("/")
 async def root():
     return {"message": "GFD API", "version": settings.APP_VERSION, "docs": "/docs"}
