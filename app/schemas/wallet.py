@@ -91,8 +91,8 @@ class WithdrawRequest(BaseModel):
     def amount_must_be_positive(cls, v: Decimal) -> Decimal:
         if v <= 0:
             raise ValueError("Amount must be greater than zero")
-        if v < Decimal("1000"):
-            raise ValueError("Minimum withdrawal amount is ₦1,000")
+        if v < Decimal("100"):
+            raise ValueError("Minimum withdrawal amount is ₦100")
         return v
 
 
