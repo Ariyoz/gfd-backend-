@@ -559,6 +559,49 @@ async def admin_list_withdrawals(
     }
 
 
+@router.get("/wallet/withdrawals/{request_id}/debug")
+async def debug_withdrawal(
+    request_id: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Debug endpoint — test approve logic step by step and return exact errors."""
+    from sqlalchemy import text as _t
+    errors = []
+    result_data = {}
+
+    # Step 1: fetch the row
+    try:
+        result = await db.execute(
+            _t("SELECT * FROM withdrawal_requests WHERE id = CAST(:rid AS UUID)"),
+            {"rid": request_id},
+        )
+        row = result.mappings().first()
+        if row:
+            result_data["row"] = {k: str(v) for k, v in row.items()}
+        else:
+            result_data["row"] = None
+            errors.append("Row not found")
+    except Exception as e:
+        errors.append(f"Step1 fetch: {e}")
+
+    # Step 2: try updating withdrawal_requests
+    try:
+        await db.execute(
+            _t("UPDATE withdrawal_requests SET status='success', updated_at=NOW() WHERE id=CAST(:rid AS UUID)"),
+            {"rid": request_id},
+        )
+        result_data["step2"] = "withdrawal_requests UPDATE ok"
+    except Exception as e:
+        errors.append(f"Step2 update wr: {e}")
+
+    # Step 3: rollback so we don't actually change anything
+    await db.rollback()
+    result_data["rollback"] = "rolled back — no real changes made"
+
+    return {"errors": errors, "data": result_data}
+
+
 @router.patch("/wallet/withdrawals/{request_id}/approve")
 async def admin_approve_withdrawal(
     request_id: str,
