@@ -566,12 +566,23 @@ async def admin_approve_withdrawal(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Approve a withdrawal request.
-    Marks as 'processing' — actual bank transfer should be triggered manually or via job.
+    Approve a withdrawal — creates a Paystack transfer recipient then initiates
+    the actual bank transfer.  Status goes:
+      pending → processing (transfer sent to Paystack)
+    Paystack webhook will later flip it to success/failed.
+    If bank_code is missing we fall back to manual (mark processing without transfer).
     """
-    from sqlalchemy import text
+    from sqlalchemy import text as _t
+    import logging
+    log = logging.getLogger("gfd.admin")
+
     result = await db.execute(
-        text("SELECT id, status FROM withdrawal_requests WHERE id = CAST(:rid AS UUID)"),
+        _t("""
+            SELECT wr.id, wr.status, wr.net_amount, wr.reference,
+                   wr.bank_name, wr.account_name, wr.account_number, wr.bank_code
+            FROM withdrawal_requests wr
+            WHERE wr.id = CAST(:rid AS UUID)
+        """),
         {"rid": request_id},
     )
     row = result.mappings().first()
@@ -580,21 +591,66 @@ async def admin_approve_withdrawal(
     if row["status"] != "pending":
         raise HTTPException(status_code=400, detail=f"Cannot approve a {row['status']} request")
 
+    transfer_code = None
+    transfer_status = "processing"
+    transfer_error = None
+
+    # ── Try Paystack transfer if we have a bank_code ──
+    bank_code = (row.get("bank_code") or "").strip()
+    if bank_code:
+        try:
+            from app.integrations.paystack_service import (
+                create_transfer_recipient,
+                initiate_transfer,
+            )
+            from decimal import Decimal
+
+            recipient_code = await create_transfer_recipient(
+                account_name=row["account_name"],
+                account_number=row["account_number"],
+                bank_code=bank_code,
+            )
+            log.info(f"[Approve] recipient_code={recipient_code} for wr={request_id}")
+
+            transfer = await initiate_transfer(
+                amount_naira=Decimal(str(row["net_amount"])),
+                recipient_code=recipient_code,
+                reference=row["reference"],
+                reason=f"GFD Wallet Withdrawal — {row['account_name']}",
+            )
+            transfer_code = transfer.get("transfer_code")
+            # Paystack may return 'otp' (requires OTP), 'success', or 'pending'
+            ps_status = transfer.get("status", "pending")
+            if ps_status == "success":
+                transfer_status = "success"
+            log.info(f"[Approve] Transfer initiated: code={transfer_code} status={ps_status}")
+        except Exception as exc:
+            transfer_error = str(exc)
+            log.warning(f"[Approve] Paystack transfer failed, falling back to manual: {exc}")
+            # Don't crash — admin will handle manually; still mark as processing
+    else:
+        log.info(f"[Approve] No bank_code for wr={request_id} — marking processing (manual)")
+
+    # ── Update DB ──
     await db.execute(
-        text("""
+        _t("""
             UPDATE withdrawal_requests
-            SET status = 'processing', processed_by = CAST(:admin_id AS UUID), updated_at = NOW()
+            SET status = :status,
+                processed_by = CAST(:admin_id AS UUID),
+                updated_at = NOW()
             WHERE id = CAST(:rid AS UUID)
         """),
-        {"rid": request_id, "admin_id": str(admin.id)},
+        {"status": transfer_status, "rid": request_id, "admin_id": str(admin.id)},
     )
     await db.execute(
-        text("""
-            UPDATE wallet_transactions SET status = 'processing', updated_at = NOW()
-            WHERE reference = (SELECT reference FROM withdrawal_requests WHERE id = CAST(:rid AS UUID))
-              AND type = 'withdrawal'
+        _t("""
+            UPDATE wallet_transactions
+            SET status = :status, updated_at = NOW()
+            WHERE reference = (
+                SELECT reference FROM withdrawal_requests WHERE id = CAST(:rid AS UUID)
+            ) AND type = 'withdrawal'
         """),
-        {"rid": request_id},
+        {"status": transfer_status, "rid": request_id},
     )
     try:
         db.add(AuditLog(
@@ -602,11 +658,32 @@ async def admin_approve_withdrawal(
             action="approve_withdrawal",
             target_type="withdrawal_request",
             target_id=UUID(request_id),
+            after_state={
+                "transfer_code": transfer_code,
+                "transfer_status": transfer_status,
+                "transfer_error": transfer_error,
+            },
         ))
     except Exception:
         pass
     await db.commit()
-    return {"message": "Withdrawal approved and marked as processing"}
+
+    if transfer_error:
+        return {
+            "message": f"Approved (manual) — Paystack transfer failed: {transfer_error}. "
+                       f"Please send ₦{row['net_amount']} to {row['account_number']} manually.",
+            "status": "processing",
+            "transfer_code": None,
+            "needs_manual": True,
+        }
+
+    return {
+        "message": "Withdrawal approved — bank transfer initiated via Paystack" if transfer_code
+                   else "Withdrawal approved — marked as processing (manual transfer required)",
+        "status": transfer_status,
+        "transfer_code": transfer_code,
+        "needs_manual": transfer_code is None,
+    }
 
 
 @router.patch("/wallet/withdrawals/{request_id}/reject")
@@ -617,16 +694,19 @@ async def admin_reject_withdrawal(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Reject a withdrawal and refund the balance back to the wallet.
+    Reject a withdrawal and refund the full amount (amount + fee) back to the user's wallet.
     """
     from decimal import Decimal
-    from sqlalchemy import text
+    from sqlalchemy import text as _t
+    import logging
+    log = logging.getLogger("gfd.admin")
 
-    reason = data.get("reason", "Rejected by admin")
+    reason = (data or {}).get("reason", "Rejected by admin")
 
     result = await db.execute(
-        text("""
-            SELECT wr.id, wr.status, wr.amount, wr.fee, wr.wallet_id, wr.reference
+        _t("""
+            SELECT wr.id, wr.status, wr.amount, wr.fee, wr.wallet_id,
+                   wr.reference, wr.user_id
             FROM withdrawal_requests wr
             WHERE wr.id = CAST(:rid AS UUID)
         """),
@@ -638,56 +718,85 @@ async def admin_reject_withdrawal(
     if row["status"] not in ("pending", "processing"):
         raise HTTPException(status_code=400, detail=f"Cannot reject a {row['status']} request")
 
+    # Refund = amount withdrawn + fee that was charged
     refund_amount = Decimal(str(row["amount"])) + Decimal(str(row["fee"]))
+    wallet_id = str(row["wallet_id"])
+    user_id   = str(row["user_id"])
+    log.info(f"[Reject] wr={request_id} refund=₦{refund_amount} wallet={wallet_id}")
 
-    # Refund balance
+    # 1. Refund balance
     await db.execute(
-        text("""
+        _t("""
             UPDATE wallets
-            SET balance = balance + :refund,
-                total_withdrawn = GREATEST(total_withdrawn - :amount, 0),
-                updated_at = NOW()
+            SET balance          = balance + :refund,
+                total_withdrawn  = GREATEST(total_withdrawn - :amount, 0),
+                updated_at       = NOW()
             WHERE id = CAST(:wid AS UUID)
         """),
-        {"refund": str(refund_amount), "amount": str(row["amount"]), "wid": str(row["wallet_id"])},
+        {"refund": str(refund_amount), "amount": str(row["amount"]), "wid": wallet_id},
     )
 
-    # Update request status
+    # 2. Mark withdrawal request as rejected
     await db.execute(
-        text("""
+        _t("""
             UPDATE withdrawal_requests
-            SET status = 'rejected', rejection_reason = :reason,
-                processed_by = CAST(:admin_id AS UUID), updated_at = NOW()
+            SET status           = 'rejected',
+                rejection_reason = :reason,
+                processed_by     = CAST(:admin_id AS UUID),
+                updated_at       = NOW()
             WHERE id = CAST(:rid AS UUID)
         """),
         {"rid": request_id, "reason": reason, "admin_id": str(admin.id)},
     )
 
-    # Record refund transaction
+    # 3. Record refund transaction
     await db.execute(
-        text("""
+        _t("""
             INSERT INTO wallet_transactions
-              (id, wallet_id, type, amount, fee, description, reference, provider, status, created_at, updated_at)
+              (id, wallet_id, type, amount, fee, description,
+               reference, provider, status, created_at, updated_at)
             VALUES
               (gen_random_uuid(), CAST(:wid AS UUID), 'refund', :amount, 0,
                :desc, :ref, 'manual', 'success', NOW(), NOW())
+            ON CONFLICT (reference) DO NOTHING
         """),
         {
-            "wid": str(row["wallet_id"]),
+            "wid": wallet_id,
             "amount": str(refund_amount),
             "desc": f"Withdrawal rejected: {reason}",
             "ref": f"REFUND-{row['reference']}",
         },
     )
 
-    # Update original withdrawal tx status
+    # 4. Mark original withdrawal tx as reversed
     await db.execute(
-        text("""
-            UPDATE wallet_transactions SET status = 'reversed', updated_at = NOW()
+        _t("""
+            UPDATE wallet_transactions
+            SET status = 'reversed', updated_at = NOW()
             WHERE reference = :ref AND type = 'withdrawal'
         """),
         {"ref": row["reference"]},
     )
+
+    # 5. Notify user
+    try:
+        await db.execute(
+            _t("""
+                INSERT INTO notifications (id, user_id, type, title, body, created_at)
+                VALUES (gen_random_uuid(), CAST(:uid AS UUID),
+                        'transfer_received',
+                        'Withdrawal Rejected',
+                        :body,
+                        NOW())
+            """),
+            {
+                "uid": user_id,
+                "body": f"Your withdrawal of ₦{row['amount']} was rejected. "
+                        f"Reason: {reason}. ₦{refund_amount} has been refunded to your wallet.",
+            },
+        )
+    except Exception as ne:
+        log.warning(f"[Reject] Notification insert failed (non-fatal): {ne}")
 
     try:
         db.add(AuditLog(
@@ -699,8 +808,14 @@ async def admin_reject_withdrawal(
         ))
     except Exception:
         pass
+
     await db.commit()
-    return {"message": "Withdrawal rejected and funds refunded to wallet"}
+    log.info(f"[Reject] Done — wr={request_id} refunded ₦{refund_amount} to wallet={wallet_id}")
+    return {
+        "message": f"Withdrawal rejected — ₦{refund_amount} refunded to user wallet",
+        "refunded": str(refund_amount),
+        "reason": reason,
+    }
 
 @router.patch("/wallet/withdrawals/{request_id}/complete")
 async def admin_complete_withdrawal(
