@@ -566,11 +566,8 @@ async def admin_approve_withdrawal(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Approve a withdrawal — creates a Paystack transfer recipient then initiates
-    the actual bank transfer.  Status goes:
-      pending → processing (transfer sent to Paystack)
-    Paystack webhook will later flip it to success/failed.
-    If bank_code is missing we fall back to manual (mark processing without transfer).
+    Admin confirms they have manually sent the money to the user's bank.
+    Marks withdrawal as 'success' and sends the user a notification.
     """
     from sqlalchemy import text as _t
     import logging
@@ -578,8 +575,8 @@ async def admin_approve_withdrawal(
 
     result = await db.execute(
         _t("""
-            SELECT wr.id, wr.status, wr.net_amount, wr.reference,
-                   wr.bank_name, wr.account_name, wr.account_number, wr.bank_code
+            SELECT wr.id, wr.status, wr.amount, wr.fee, wr.net_amount,
+                   wr.reference, wr.user_id, wr.bank_name, wr.account_name, wr.account_number
             FROM withdrawal_requests wr
             WHERE wr.id = CAST(:rid AS UUID)
         """),
@@ -588,102 +585,73 @@ async def admin_approve_withdrawal(
     row = result.mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Withdrawal request not found")
-    if row["status"] != "pending":
+    if row["status"] not in ("pending", "processing"):
         raise HTTPException(status_code=400, detail=f"Cannot approve a {row['status']} request")
 
-    transfer_code = None
-    transfer_status = "processing"
-    transfer_error = None
+    user_id = str(row["user_id"])
 
-    # ── Try Paystack transfer if we have a bank_code ──
-    bank_code = (row.get("bank_code") or "").strip()
-    if bank_code:
-        try:
-            from app.integrations.paystack_service import (
-                create_transfer_recipient,
-                initiate_transfer,
-            )
-            from decimal import Decimal
-
-            recipient_code = await create_transfer_recipient(
-                account_name=row["account_name"],
-                account_number=row["account_number"],
-                bank_code=bank_code,
-            )
-            log.info(f"[Approve] recipient_code={recipient_code} for wr={request_id}")
-
-            transfer = await initiate_transfer(
-                amount_naira=Decimal(str(row["net_amount"])),
-                recipient_code=recipient_code,
-                reference=row["reference"],
-                reason=f"GFD Wallet Withdrawal — {row['account_name']}",
-            )
-            transfer_code = transfer.get("transfer_code")
-            # Paystack may return 'otp' (requires OTP), 'success', or 'pending'
-            ps_status = transfer.get("status", "pending")
-            if ps_status == "success":
-                transfer_status = "success"
-            log.info(f"[Approve] Transfer initiated: code={transfer_code} status={ps_status}")
-        except Exception as exc:
-            transfer_error = str(exc)
-            log.warning(f"[Approve] Paystack transfer failed, falling back to manual: {exc}")
-            # Don't crash — admin will handle manually; still mark as processing
-    else:
-        log.info(f"[Approve] No bank_code for wr={request_id} — marking processing (manual)")
-
-    # ── Update DB ──
+    # 1. Mark withdrawal as success
     await db.execute(
         _t("""
             UPDATE withdrawal_requests
-            SET status = :status,
+            SET status       = 'success',
                 processed_by = CAST(:admin_id AS UUID),
-                updated_at = NOW()
+                updated_at   = NOW()
             WHERE id = CAST(:rid AS UUID)
         """),
-        {"status": transfer_status, "rid": request_id, "admin_id": str(admin.id)},
+        {"rid": request_id, "admin_id": str(admin.id)},
     )
+
+    # 2. Mark the wallet transaction as success
     await db.execute(
         _t("""
             UPDATE wallet_transactions
-            SET status = :status, updated_at = NOW()
-            WHERE reference = (
-                SELECT reference FROM withdrawal_requests WHERE id = CAST(:rid AS UUID)
-            ) AND type = 'withdrawal'
+            SET status = 'success', updated_at = NOW()
+            WHERE reference = :ref AND type = 'withdrawal'
         """),
-        {"status": transfer_status, "rid": request_id},
+        {"ref": row["reference"]},
     )
+
+    # 3. Notify the user — "Withdrawal Successful"
+    try:
+        await db.execute(
+            _t("""
+                INSERT INTO notifications (id, user_id, type, title, body, created_at)
+                VALUES (
+                    gen_random_uuid(),
+                    CAST(:uid AS UUID),
+                    'transfer_received',
+                    'Withdrawal Successful',
+                    :body,
+                    NOW()
+                )
+            """),
+            {
+                "uid": user_id,
+                "body": (
+                    f"Your withdrawal of ₦{row['net_amount']} to "
+                    f"{row['account_name']} ({row['bank_name']}) "
+                    f"has been processed successfully."
+                ),
+            },
+        )
+    except Exception as ne:
+        log.warning(f"[Approve] Notification failed (non-fatal): {ne}")
+
     try:
         db.add(AuditLog(
             admin_id=admin.id,
             action="approve_withdrawal",
             target_type="withdrawal_request",
             target_id=UUID(request_id),
-            after_state={
-                "transfer_code": transfer_code,
-                "transfer_status": transfer_status,
-                "transfer_error": transfer_error,
-            },
+            after_state={"status": "success", "net_amount": str(row["net_amount"])},
         ))
     except Exception:
         pass
+
     await db.commit()
-
-    if transfer_error:
-        return {
-            "message": f"Approved (manual) — Paystack transfer failed: {transfer_error}. "
-                       f"Please send ₦{row['net_amount']} to {row['account_number']} manually.",
-            "status": "processing",
-            "transfer_code": None,
-            "needs_manual": True,
-        }
-
-    return {
-        "message": "Withdrawal approved — bank transfer initiated via Paystack" if transfer_code
-                   else "Withdrawal approved — marked as processing (manual transfer required)",
-        "status": transfer_status,
-        "transfer_code": transfer_code,
-        "needs_manual": transfer_code is None,
-    }
+    log.info(f"[Approve] wr={request_id} marked success, user={user_id} notified")
+    return {"message": "Withdrawal marked as successful — user has been notified"}
 
 
 @router.patch("/wallet/withdrawals/{request_id}/reject")
