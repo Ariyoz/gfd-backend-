@@ -416,6 +416,8 @@ async def lifespan(app: FastAPI):
                 ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS dva_id VARCHAR(100);
                 ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
                 ALTER TABLE virtual_accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+                ALTER TABLE withdrawal_requests ADD COLUMN IF NOT EXISTS processed_by UUID REFERENCES users(id) ON DELETE SET NULL;
+                ALTER TABLE withdrawal_requests ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
             """))
         print("✅ Wallet tables ready")
     except Exception as e:

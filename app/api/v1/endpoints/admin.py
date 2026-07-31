@@ -638,12 +638,11 @@ async def admin_approve_withdrawal(
         await db.execute(
             _t("""
                 UPDATE withdrawal_requests
-                SET status       = 'success',
-                    processed_by = CAST(:admin_id AS UUID),
-                    updated_at   = NOW()
+                SET status     = 'success',
+                    updated_at = NOW()
                 WHERE id = CAST(:rid AS UUID)
             """),
-            {"rid": request_id, "admin_id": str(admin.id)},
+            {"rid": request_id},
         )
 
         # 2. Mark the wallet transaction as success
@@ -757,11 +756,10 @@ async def admin_reject_withdrawal(
                 UPDATE withdrawal_requests
                 SET status           = 'rejected',
                     rejection_reason = :reason,
-                    processed_by     = CAST(:admin_id AS UUID),
                     updated_at       = NOW()
                 WHERE id = CAST(:rid AS UUID)
             """),
-            {"rid": request_id, "reason": reason, "admin_id": str(admin.id)},
+            {"rid": request_id, "reason": reason},
         )
 
         # 3. Record refund credit transaction
@@ -863,7 +861,7 @@ async def admin_complete_withdrawal(
     await db.execute(
         text("""
             UPDATE withdrawal_requests
-            SET status = 'success', processed_by = CAST(:admin_id AS UUID), updated_at = NOW()
+            SET status = 'success', updated_at = NOW()
             WHERE id = CAST(:rid AS UUID)
         """),
         {"rid": request_id, "admin_id": str(admin.id)},
