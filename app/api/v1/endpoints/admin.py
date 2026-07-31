@@ -596,12 +596,15 @@ async def admin_approve_withdrawal(
         """),
         {"rid": request_id},
     )
-    db.add(AuditLog(
-        admin_id=admin.id,
-        action="approve_withdrawal",
-        target_type="withdrawal_request",
-        target_id=UUID(request_id),
-    ))
+    try:
+        db.add(AuditLog(
+            admin_id=admin.id,
+            action="approve_withdrawal",
+            target_type="withdrawal_request",
+            target_id=UUID(request_id),
+        ))
+    except Exception:
+        pass
     await db.commit()
     return {"message": "Withdrawal approved and marked as processing"}
 
@@ -686,16 +689,18 @@ async def admin_reject_withdrawal(
         {"ref": row["reference"]},
     )
 
-    db.add(AuditLog(
-        admin_id=admin.id,
-        action="reject_withdrawal",
-        target_type="withdrawal_request",
-        target_id=UUID(request_id),
-        reason=reason,
-    ))
+    try:
+        db.add(AuditLog(
+            admin_id=admin.id,
+            action="reject_withdrawal",
+            target_type="withdrawal_request",
+            target_id=UUID(request_id),
+            reason=reason,
+        ))
+    except Exception:
+        pass
     await db.commit()
     return {"message": "Withdrawal rejected and funds refunded to wallet"}
-
 
 @router.patch("/wallet/withdrawals/{request_id}/complete")
 async def admin_complete_withdrawal(
@@ -731,12 +736,15 @@ async def admin_complete_withdrawal(
         """),
         {"rid": request_id},
     )
-    db.add(AuditLog(
-        admin_id=admin.id,
-        action="complete_withdrawal",
-        target_type="withdrawal_request",
-        target_id=UUID(request_id),
-    ))
+    try:
+        db.add(AuditLog(
+            admin_id=admin.id,
+            action="complete_withdrawal",
+            target_type="withdrawal_request",
+            target_id=UUID(request_id),
+        ))
+    except Exception:
+        pass
     await db.commit()
     return {"message": "Withdrawal marked as completed"}
 
