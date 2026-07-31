@@ -639,30 +639,20 @@ async def admin_approve_withdrawal(
     # 4. Notify user in a completely separate DB session so it never blocks the approve
     try:
         from app.database.session import AsyncSessionLocal
+        from app.models.notification import Notification, NotificationType
         async with AsyncSessionLocal() as notif_db:
-            await notif_db.execute(
-                _t("""
-                    INSERT INTO notifications (id, user_id, type, title, body, is_read, created_at)
-                    VALUES (
-                        gen_random_uuid(),
-                        CAST(:uid AS UUID),
-                        'transfer_received'::notificationtype,
-                        'Withdrawal Successful',
-                        :body,
-                        FALSE,
-                        NOW()
-                    )
-                    ON CONFLICT DO NOTHING
-                """),
-                {
-                    "uid": user_id,
-                    "body": (
-                        f"Your withdrawal of ₦{row['net_amount']} to "
-                        f"{row['account_name']} ({row['bank_name']}) "
-                        f"has been processed successfully."
-                    ),
-                },
-            )
+            notif_db.add(Notification(
+                user_id=UUID(user_id),
+                type=NotificationType.TRANSFER_RECEIVED,
+                title="Withdrawal Successful ✓",
+                body=(
+                    f"Your withdrawal of ₦{row['net_amount']} to "
+                    f"{row['account_name']} ({row['bank_name']}) "
+                    f"has been processed successfully."
+                ),
+                is_read=False,
+                data={"withdrawal_id": request_id},
+            ))
             await notif_db.commit()
     except Exception as ne:
         log.warning(f"[Approve] Notification failed (non-fatal): {ne}")
@@ -786,30 +776,20 @@ async def admin_reject_withdrawal(
     # 6. Notify user in separate session
     try:
         from app.database.session import AsyncSessionLocal
+        from app.models.notification import Notification, NotificationType
         async with AsyncSessionLocal() as notif_db:
-            await notif_db.execute(
-                _t("""
-                    INSERT INTO notifications (id, user_id, type, title, body, is_read, created_at)
-                    VALUES (
-                        gen_random_uuid(),
-                        CAST(:uid AS UUID),
-                        'transfer_received'::notificationtype,
-                        'Withdrawal Rejected — Funds Refunded',
-                        :body,
-                        FALSE,
-                        NOW()
-                    )
-                    ON CONFLICT DO NOTHING
-                """),
-                {
-                    "uid": user_id,
-                    "body": (
-                        f"Your withdrawal of ₦{row['amount']} was rejected. "
-                        f"Reason: {reason}. "
-                        f"₦{refund_amount} has been refunded to your wallet."
-                    ),
-                },
-            )
+            notif_db.add(Notification(
+                user_id=UUID(user_id),
+                type=NotificationType.TRANSFER_RECEIVED,
+                title="Withdrawal Rejected — Funds Refunded",
+                body=(
+                    f"Your withdrawal of ₦{row['amount']} was rejected. "
+                    f"Reason: {reason}. "
+                    f"₦{refund_amount} has been refunded to your wallet."
+                ),
+                is_read=False,
+                data={"withdrawal_id": request_id},
+            ))
             await notif_db.commit()
     except Exception as ne:
         log.warning(f"[Reject] Notification failed (non-fatal): {ne}")
