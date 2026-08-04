@@ -86,6 +86,7 @@ async def explore_developers(
             "username": user.username,
             "full_name": user.full_name,
             "avatar": user.avatar,
+            "banner": user.banner,
             "bio": profile.bio,
             "location": profile.location,
             "skills": profile.skills or [],
@@ -98,6 +99,7 @@ async def explore_developers(
             "portfolio_url": profile.portfolio_url,
             "follower_count": fc,
             "is_verified": user.is_verified,
+            "job_title": profile.job_title if hasattr(profile, 'job_title') else None,
             "created_at": str(user.created_at),
         })
 
