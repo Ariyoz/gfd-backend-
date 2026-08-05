@@ -2,8 +2,10 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, and_
+from sqlalchemy.orm import selectinload
 from uuid import UUID
+from typing import List
 
 from app.database import get_db
 from app.models import User, Conversation, ConversationParticipant, Message, Notification, NotificationType
@@ -129,3 +131,142 @@ async def hire_developer(
         "message": "Hire request sent!",
         "conversation_id": str(conv.id),
     }
+
+
+@router.get("/requests/sent")
+async def get_sent_hire_requests(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all hire requests sent BY this user (they sent the first message)."""
+    # Find conversations named "Hire Request:..." where this user sent the first message
+    part_q = await db.execute(
+        select(ConversationParticipant.conversation_id)
+        .where(ConversationParticipant.user_id == user.id)
+    )
+    conv_ids = [r[0] for r in part_q.fetchall()]
+
+    if not conv_ids:
+        return {"requests": []}
+
+    conv_q = await db.execute(
+        select(Conversation)
+        .where(
+            and_(
+                Conversation.id.in_(conv_ids),
+                Conversation.name.like("Hire Request:%"),
+            )
+        )
+        .order_by(Conversation.created_at.desc())
+    )
+    convs = conv_q.scalars().all()
+
+    results = []
+    for conv in convs:
+        # Get the first message — only include if this user SENT it
+        msg_q = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conv.id)
+            .order_by(Message.created_at.asc())
+            .limit(1)
+        )
+        first_msg = msg_q.scalar_one_or_none()
+        if not first_msg or str(first_msg.sender_id) != str(user.id):
+            continue  # skip — user didn't send this request
+
+        # Get the other participant (developer)
+        other_q = await db.execute(
+            select(ConversationParticipant)
+            .where(
+                and_(
+                    ConversationParticipant.conversation_id == conv.id,
+                    ConversationParticipant.user_id != user.id,
+                )
+            )
+        )
+        other_part = other_q.scalar_one_or_none()
+        dev_name = ""
+        dev_avatar = None
+        if other_part:
+            dev_q = await db.execute(select(User).where(User.id == other_part.user_id))
+            dev = dev_q.scalar_one_or_none()
+            if dev:
+                dev_name = dev.full_name or dev.username or ""
+                dev_avatar = dev.avatar
+
+        project_title = conv.name.replace("Hire Request: ", "", 1)
+
+        results.append({
+            "id": str(conv.id),
+            "project_title": project_title,
+            "developer_name": dev_name,
+            "developer_avatar": dev_avatar,
+            "conversation_id": str(conv.id),
+            "status": "sent",
+            "created_at": conv.created_at.isoformat() if conv.created_at else None,
+            "preview": (first_msg.content or "")[:120],
+        })
+
+    return {"requests": results}
+
+
+@router.get("/requests/received")
+async def get_received_hire_requests(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all hire requests received BY this user (someone else sent the first message)."""
+    part_q = await db.execute(
+        select(ConversationParticipant.conversation_id)
+        .where(ConversationParticipant.user_id == user.id)
+    )
+    conv_ids = [r[0] for r in part_q.fetchall()]
+
+    if not conv_ids:
+        return {"requests": []}
+
+    conv_q = await db.execute(
+        select(Conversation)
+        .where(
+            and_(
+                Conversation.id.in_(conv_ids),
+                Conversation.name.like("Hire Request:%"),
+            )
+        )
+        .order_by(Conversation.created_at.desc())
+    )
+    convs = conv_q.scalars().all()
+
+    results = []
+    for conv in convs:
+        # Get the first message — only include if someone ELSE sent it
+        msg_q = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conv.id)
+            .order_by(Message.created_at.asc())
+            .limit(1)
+        )
+        first_msg = msg_q.scalar_one_or_none()
+        if not first_msg or str(first_msg.sender_id) == str(user.id):
+            continue  # skip — user sent this, not received
+
+        # Get the sender (client)
+        client_q = await db.execute(select(User).where(User.id == first_msg.sender_id))
+        client = client_q.scalar_one_or_none()
+        client_name = (client.full_name or client.username or "") if client else ""
+        client_avatar = client.avatar if client else None
+
+        project_title = conv.name.replace("Hire Request: ", "", 1)
+
+        results.append({
+            "id": str(conv.id),
+            "project_title": project_title,
+            "client_name": client_name,
+            "client_avatar": client_avatar,
+            "conversation_id": str(conv.id),
+            "status": "pending",
+            "created_at": conv.created_at.isoformat() if conv.created_at else None,
+            "preview": (first_msg.content or "")[:120],
+        })
+
+    return {"requests": results}
