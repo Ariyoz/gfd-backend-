@@ -288,7 +288,7 @@ async def get_all_subscriptions(
         subs.append({
             "id": str(row["id"]),
             "user_id": str(row["user_id"]),
-            "user_name": row["full_name"] or "Unknown",
+            "user_name": row["full_name"] or row.get("username") or row.get("payment_reference") or "Unknown",
             "user_email": row["email"] or "",
             "username": row.get("username") or row.get("payment_reference") or "",
             "user_avatar": row.get("avatar") or None,
@@ -305,7 +305,29 @@ async def get_all_subscriptions(
     return {"subscriptions": subs, "total": len(subs)}
 
 
-@router.patch("/subscriptions/{sub_id}/approve")
+@router.post("/subscriptions/fix-orphaned-badges")
+async def fix_orphaned_badges(admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Remove verified badges from users who have no active subscription."""
+    from sqlalchemy import text
+    try:
+        result = await db.execute(text("""
+            UPDATE users
+            SET is_verified = FALSE
+            WHERE is_verified = TRUE
+              AND id NOT IN (
+                SELECT DISTINCT user_id FROM subscriptions
+                WHERE status = 'active'
+              )
+            RETURNING id, full_name, username
+        """))
+        fixed = result.mappings().all()
+        await db.commit()
+        return {
+            "message": f"Removed badges from {len(fixed)} user(s) with no active subscription",
+            "fixed_users": [{"id": str(r["id"]), "name": r["full_name"] or r["username"]} for r in fixed]
+        }
+    except Exception as e:
+        return {"message": f"Error: {e}", "fixed_users": []}
 async def approve_subscription(sub_id: str, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)):
     """Approve a subscription and grant verified badge."""
     from sqlalchemy import text
