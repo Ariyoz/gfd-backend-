@@ -244,7 +244,7 @@ async def github_callback(code: str, db: AsyncSession = Depends(get_db)):
                     avatar=github_user.get("avatar_url"),
                     role=UserRole.DEVELOPER,
                     status=UserStatus.ACTIVE,
-                    is_verified=True,
+                    is_verified=False,  # Badge only granted after paid subscription approved by admin
                 )
                 db.add(user)
                 await db.flush()
@@ -338,7 +338,7 @@ async def google_callback(code: str, db: AsyncSession = Depends(get_db)):
                     avatar=google_user.get("picture"),
                     role=UserRole.DEVELOPER,
                     status=UserStatus.ACTIVE,
-                    is_verified=True,
+                    is_verified=False,  # Badge only granted after paid subscription approved by admin
                 )
                 db.add(user)
                 await db.flush()
