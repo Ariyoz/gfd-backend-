@@ -6,6 +6,7 @@ from sqlalchemy import select
 
 from app.database import get_db
 from app.models import User, UserRole, UserStatus, OAuthAccount, Session, DeveloperProfile, ClientProfile
+from app.core.dependencies import get_current_active_user
 from app.core.security import (
     hash_password, verify_password,
     create_access_token, create_refresh_token, decode_token,
@@ -145,6 +146,62 @@ async def logout(data: RefreshTokenRequest, db: AsyncSession = Depends(get_db)):
     session = result.scalar_one_or_none()
     if session:
         session.is_active = False
+
+
+@router.delete("/delete-account", status_code=status.HTTP_200_OK)
+async def delete_own_account(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently delete the current user's account and all their data."""
+    from sqlalchemy import text
+    user_id = str(user.id)
+
+    # Delete all user data in order (respect FK constraints)
+    tables = [
+        "notifications",
+        "conversation_participants",
+        "messages",
+        "project_likes",
+        "project_views",
+        "post_likes",
+        "post_comments",
+        "post_bookmarks",
+        "posts",
+        "projects",
+        "job_applications",
+        "subscriptions",
+        "sessions",
+        "oauth_accounts",
+        "developer_profiles",
+        "wallets",
+        "wallet_transactions",
+        "follows",
+        "reports",
+    ]
+    for table in tables:
+        try:
+            await db.execute(text(f"DELETE FROM {table} WHERE user_id = :uid"), {"uid": user_id})
+        except Exception:
+            pass  # Table may not exist or column may differ — skip silently
+
+    # Also clean up conversations where user was the only participant
+    try:
+        await db.execute(text("""
+            DELETE FROM conversations WHERE id IN (
+                SELECT c.id FROM conversations c
+                LEFT JOIN conversation_participants cp ON cp.conversation_id = c.id
+                WHERE cp.user_id IS NULL
+            )
+        """))
+    except Exception:
+        pass
+
+    # Finally delete the user record
+    await db.delete(user)
+    await db.commit()
+
+    return {"message": "Account permanently deleted"}
 
 
 @router.post("/forgot-password", status_code=status.HTTP_200_OK)

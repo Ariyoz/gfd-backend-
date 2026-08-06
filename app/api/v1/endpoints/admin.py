@@ -70,24 +70,51 @@ async def get_analytics(user: User = Depends(require_admin), db: AsyncSession = 
 @router.get("/users")
 async def list_users(
     page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=200),
     role: str = Query(None),
     status_filter: str = Query(None),
     search: str = Query(None),
     user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all users with filtering."""
-    offset = (page - 1) * limit
-    query = select(User).offset(offset).limit(limit)
+    """List all users with filtering and total count."""
+    from sqlalchemy import func as sqlfunc
+
+    # Build filter conditions
+    conditions = []
     if role:
-        query = query.where(User.role == role)
+        conditions.append(User.role == role)
     if status_filter:
-        query = query.where(User.status == status_filter)
+        conditions.append(User.status == status_filter)
     if search:
-        query = query.where(User.full_name.ilike(f"%{search}%") | User.email.ilike(f"%{search}%"))
+        conditions.append(
+            User.full_name.ilike(f"%{search}%") |
+            User.email.ilike(f"%{search}%") |
+            User.username.ilike(f"%{search}%")
+        )
+
+    # Total count (before pagination)
+    count_q = select(sqlfunc.count()).select_from(User)
+    for c in conditions:
+        count_q = count_q.where(c)
+    total = (await db.execute(count_q)).scalar() or 0
+
+    # Paginated data
+    offset = (page - 1) * limit
+    query = select(User).order_by(User.created_at.desc()).offset(offset).limit(limit)
+    for c in conditions:
+        query = query.where(c)
+
     result = await db.execute(query)
-    return {"users": result.scalars().all()}
+    user_rows = result.scalars().all()
+
+    return {
+        "users": user_rows,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "pages": max(1, (total + limit - 1) // limit),
+    }
 
 
 @router.patch("/users/{user_id}/suspend")
