@@ -423,6 +423,45 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"❌ Wallet table migration failed: {e}")
 
+    # ── Crypto wallet tables ──────────────────────────────────────────────────
+    try:
+        from app.database.session import engine
+        from sqlalchemy import text as _ct
+        async with engine.begin() as conn:
+            await conn.execute(_ct("""
+                CREATE TABLE IF NOT EXISTS crypto_wallets (
+                    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id    UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS crypto_transactions (
+                    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    coin             VARCHAR(20) NOT NULL,
+                    type             VARCHAR(20) NOT NULL DEFAULT 'deposit',
+                    amount_credited  NUMERIC(36,18) DEFAULT 0,
+                    amount_withdrawn NUMERIC(36,18) DEFAULT 0,
+                    usd_value        NUMERIC(20,6)  DEFAULT 0,
+                    tx_hash          VARCHAR(200),
+                    payment_id       VARCHAR(200) UNIQUE,
+                    from_address     VARCHAR(200),
+                    to_address       VARCHAR(200),
+                    network          VARCHAR(50),
+                    status           VARCHAR(30) NOT NULL DEFAULT 'pending',
+                    confirmations    INTEGER DEFAULT 0,
+                    created_at       TIMESTAMP DEFAULT NOW(),
+                    updated_at       TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_crypto_tx_user       ON crypto_transactions(user_id);
+                CREATE INDEX IF NOT EXISTS idx_crypto_tx_coin       ON crypto_transactions(coin);
+                CREATE INDEX IF NOT EXISTS idx_crypto_tx_status     ON crypto_transactions(status);
+                CREATE INDEX IF NOT EXISTS idx_crypto_tx_payment_id ON crypto_transactions(payment_id);
+            """))
+        print("✅ Crypto tables ready")
+    except Exception as e:
+        print(f"❌ Crypto table migration failed: {e}")
+
     # ── Keep-alive: ping self every 10 min so Render free tier stays warm ──
     import asyncio
     import httpx

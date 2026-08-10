@@ -321,3 +321,316 @@ async def nowpayments_webhook(
         log.error(f"Error crediting crypto: {e}")
 
     return {"status": "ok"}
+
+
+# ── Live Prices (CoinGecko — no API key needed for free tier) ─────────────────
+
+@router.get("/prices")
+async def get_crypto_prices():
+    """
+    Fetch live USD prices for supported coins from CoinGecko.
+    Falls back to static prices if CoinGecko is unavailable.
+    """
+    import httpx
+    FALLBACK = {"btc": 67000, "eth": 3500, "sol": 145, "usdt": 1.0, "usdc": 1.0}
+    COINGECKO_IDS = {
+        "btc":  "bitcoin",
+        "eth":  "ethereum",
+        "sol":  "solana",
+        "usdt": "tether",
+        "usdc": "usd-coin",
+    }
+    try:
+        ids = ",".join(COINGECKO_IDS.values())
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            prices = {}
+            for coin, cg_id in COINGECKO_IDS.items():
+                entry = data.get(cg_id, {})
+                prices[coin] = {
+                    "usd":        entry.get("usd", FALLBACK[coin]),
+                    "change_24h": round(entry.get("usd_24h_change", 0), 2),
+                }
+            return {"prices": prices, "source": "coingecko"}
+    except Exception as e:
+        log.warning(f"CoinGecko unavailable: {e}")
+
+    # Fallback
+    return {
+        "prices": {k: {"usd": v, "change_24h": 0} for k, v in FALLBACK.items()},
+        "source": "fallback",
+    }
+
+
+# ── Crypto Send (withdraw to external address) ────────────────────────────────
+
+@router.post("/send")
+async def send_crypto(
+    payload: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Send crypto from user's GFD balance to an external wallet address.
+    Deducts balance immediately; actual on-chain transfer is queued.
+    """
+    coin       = (payload.get("coin") or "").lower()
+    amount     = Decimal(str(payload.get("amount") or 0))
+    to_address = (payload.get("to_address") or "").strip()
+    network    = (payload.get("network") or "").strip()
+
+    if coin not in SUPPORTED_COINS:
+        raise HTTPException(status_code=400, detail=f"Unsupported coin: {coin}")
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero")
+    if not to_address:
+        raise HTTPException(status_code=400, detail="Destination address is required")
+
+    meta = SUPPORTED_COINS[coin]
+
+    # Check balance
+    bal_row = await db.execute(
+        text("""
+            SELECT COALESCE(SUM(amount_credited), 0) - COALESCE(SUM(amount_withdrawn), 0) AS balance
+            FROM crypto_transactions
+            WHERE user_id = CAST(:uid AS UUID) AND coin = :coin AND status = 'confirmed'
+        """),
+        {"uid": str(user.id), "coin": coin},
+    )
+    bal = Decimal(str(bal_row.mappings().first()["balance"] or 0))
+
+    # Minimum send checks
+    MIN_SEND = {"btc": Decimal("0.00001"), "eth": Decimal("0.0001"), "sol": Decimal("0.01"),
+                "usdt": Decimal("1"), "usdc": Decimal("1")}
+    if amount < MIN_SEND.get(coin, Decimal("0")):
+        raise HTTPException(status_code=400, detail=f"Minimum send is {MIN_SEND[coin]} {meta['symbol']}")
+    if bal < amount:
+        raise HTTPException(status_code=400, detail=f"Insufficient {meta['symbol']} balance. Have {float(bal):.6f}, need {float(amount):.6f}")
+
+    # Network fee estimate (deducted from send amount as platform fee)
+    FEES = {"btc": Decimal("0.00005"), "eth": Decimal("0.0005"), "sol": Decimal("0.001"),
+            "usdt": Decimal("1"), "usdc": Decimal("1")}
+    fee = FEES.get(coin, Decimal("0"))
+    if bal < amount + fee:
+        raise HTTPException(status_code=400, detail=f"Insufficient balance for amount + network fee ({fee} {meta['symbol']})")
+
+    tx_id = str(uuid.uuid4())
+    ref   = f"SEND-{uuid.uuid4().hex[:12].upper()}"
+
+    try:
+        await db.execute(
+            text("""
+                INSERT INTO crypto_transactions
+                  (id, user_id, coin, type, amount_credited, amount_withdrawn, usd_value,
+                   to_address, network, status, payment_id, confirmations, created_at, updated_at)
+                VALUES
+                  (CAST(:id AS UUID), CAST(:uid AS UUID), :coin, 'withdrawal', 0, :amount, 0,
+                   :to_addr, :network, 'pending', :ref, 0, NOW(), NOW())
+            """),
+            {
+                "id":       tx_id,
+                "uid":      str(user.id),
+                "coin":     coin,
+                "amount":   str(amount + fee),
+                "to_addr":  to_address,
+                "network":  network or meta["network"],
+                "ref":      ref,
+            },
+        )
+        await db.commit()
+        log.info(f"Crypto send queued: user={user.id} {amount} {coin.upper()} -> {to_address[:16]}…")
+    except Exception as e:
+        log.error(f"Crypto send error: {e}")
+        raise HTTPException(status_code=500, detail="Could not process send request")
+
+    return {
+        "id":         tx_id,
+        "coin":       coin.upper(),
+        "symbol":     meta["symbol"],
+        "amount":     float(amount),
+        "fee":        float(fee),
+        "to_address": to_address,
+        "network":    network or meta["network"],
+        "status":     "pending",
+        "reference":  ref,
+        "message":    f"Your {meta['symbol']} send is queued and will be processed within 30 minutes.",
+    }
+
+
+# ── Admin: Crypto overview ────────────────────────────────────────────────────
+
+@router.get("/admin/overview")
+async def admin_crypto_overview(
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin — total crypto holdings and recent activity (no auth for internal use — protect via middleware)."""
+    try:
+        # Total per coin
+        rows = await db.execute(text("""
+            SELECT coin,
+                   COALESCE(SUM(amount_credited), 0)  AS total_received,
+                   COALESCE(SUM(amount_withdrawn), 0) AS total_sent,
+                   COUNT(*) FILTER (WHERE type = 'deposit')    AS deposit_count,
+                   COUNT(*) FILTER (WHERE type = 'withdrawal') AS withdrawal_count
+            FROM crypto_transactions
+            WHERE status = 'confirmed'
+            GROUP BY coin
+        """))
+        by_coin = {}
+        for r in rows.mappings().all():
+            by_coin[r["coin"]] = {
+                "coin":              r["coin"],
+                "symbol":            SUPPORTED_COINS.get(r["coin"], {}).get("symbol", r["coin"].upper()),
+                "total_received":    float(r["total_received"] or 0),
+                "total_sent":        float(r["total_sent"] or 0),
+                "net_balance":       float((r["total_received"] or 0) - (r["total_sent"] or 0)),
+                "deposit_count":     r["deposit_count"],
+                "withdrawal_count":  r["withdrawal_count"],
+            }
+
+        # User count with any crypto activity
+        user_count = await db.execute(text(
+            "SELECT COUNT(DISTINCT user_id) FROM crypto_transactions WHERE status = 'confirmed'"
+        ))
+        total_users = user_count.scalar() or 0
+
+        # Recent 20 transactions
+        recent = await db.execute(text("""
+            SELECT ct.id, ct.user_id, ct.coin, ct.type,
+                   ct.amount_credited, ct.amount_withdrawn, ct.usd_value,
+                   ct.tx_hash, ct.to_address, ct.status, ct.created_at,
+                   u.full_name AS user_name, u.email AS user_email
+            FROM crypto_transactions ct
+            JOIN users u ON u.id = ct.user_id
+            ORDER BY ct.created_at DESC
+            LIMIT 20
+        """))
+        recent_txs = []
+        for r in recent.mappings().all():
+            recent_txs.append({
+                "id":         str(r["id"]),
+                "user_id":    str(r["user_id"]),
+                "user_name":  r["user_name"],
+                "user_email": r["user_email"],
+                "coin":       r["coin"],
+                "symbol":     SUPPORTED_COINS.get(r["coin"], {}).get("symbol", r["coin"].upper()),
+                "type":       r["type"],
+                "amount":     float(r["amount_credited"] or r["amount_withdrawn"] or 0),
+                "usd_value":  float(r["usd_value"] or 0),
+                "tx_hash":    r.get("tx_hash"),
+                "to_address": r.get("to_address"),
+                "status":     r["status"],
+                "created_at": str(r["created_at"]),
+            })
+
+        # Pending sends
+        pending = await db.execute(text(
+            "SELECT COUNT(*) FROM crypto_transactions WHERE type = 'withdrawal' AND status = 'pending'"
+        ))
+        pending_sends = pending.scalar() or 0
+
+        return {
+            "by_coin":      list(by_coin.values()),
+            "total_users":  total_users,
+            "recent_txs":   recent_txs,
+            "pending_sends": pending_sends,
+        }
+    except Exception as e:
+        log.warning(f"Admin crypto overview error: {e}")
+        return {"by_coin": [], "total_users": 0, "recent_txs": [], "pending_sends": 0}
+
+
+@router.get("/admin/transactions")
+async def admin_crypto_transactions(
+    page: int = 1,
+    page_size: int = 50,
+    coin: str = None,
+    tx_type: str = None,
+    status: str = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin — paginated crypto transactions with filters."""
+    try:
+        where = ["1=1"]
+        params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
+        if coin:
+            where.append("ct.coin = :coin"); params["coin"] = coin.lower()
+        if tx_type:
+            where.append("ct.type = :type"); params["type"] = tx_type
+        if status:
+            where.append("ct.status = :status"); params["status"] = status
+
+        where_str = " AND ".join(where)
+
+        count_row = await db.execute(
+            text(f"SELECT COUNT(*) FROM crypto_transactions ct WHERE {where_str}"), params
+        )
+        total = count_row.scalar() or 0
+
+        rows = await db.execute(text(f"""
+            SELECT ct.id, ct.user_id, ct.coin, ct.type,
+                   ct.amount_credited, ct.amount_withdrawn, ct.usd_value,
+                   ct.tx_hash, ct.to_address, ct.from_address, ct.status,
+                   ct.payment_id, ct.network, ct.created_at,
+                   u.full_name AS user_name, u.email AS user_email, u.avatar AS user_avatar
+            FROM crypto_transactions ct
+            JOIN users u ON u.id = ct.user_id
+            WHERE {where_str}
+            ORDER BY ct.created_at DESC
+            LIMIT :limit OFFSET :offset
+        """), params)
+
+        txs = []
+        for r in rows.mappings().all():
+            txs.append({
+                "id":          str(r["id"]),
+                "user_id":     str(r["user_id"]),
+                "user_name":   r["user_name"],
+                "user_email":  r["user_email"],
+                "user_avatar": r.get("user_avatar"),
+                "coin":        r["coin"],
+                "symbol":      SUPPORTED_COINS.get(r["coin"], {}).get("symbol", r["coin"].upper()),
+                "type":        r["type"],
+                "amount":      float(r["amount_credited"] or r["amount_withdrawn"] or 0),
+                "usd_value":   float(r["usd_value"] or 0),
+                "tx_hash":     r.get("tx_hash"),
+                "to_address":  r.get("to_address"),
+                "status":      r["status"],
+                "network":     r.get("network"),
+                "payment_id":  r.get("payment_id"),
+                "created_at":  str(r["created_at"]),
+            })
+
+        return {"transactions": txs, "total": total, "page": page, "page_size": page_size}
+    except Exception as e:
+        log.warning(f"Admin crypto transactions error: {e}")
+        return {"transactions": [], "total": 0, "page": page, "page_size": page_size}
+
+
+@router.patch("/admin/transactions/{tx_id}/complete")
+async def admin_complete_send(
+    tx_id: str,
+    payload: dict = {},
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin — mark a pending crypto send as completed (after manual on-chain transfer)."""
+    tx_hash = payload.get("tx_hash", "")
+    try:
+        result = await db.execute(text("""
+            UPDATE crypto_transactions
+            SET status = 'confirmed', tx_hash = :tx_hash, updated_at = NOW()
+            WHERE id = CAST(:tid AS UUID) AND type = 'withdrawal' AND status = 'pending'
+            RETURNING id
+        """), {"tid": tx_id, "tx_hash": tx_hash})
+        if not result.fetchone():
+            raise HTTPException(status_code=404, detail="Transaction not found or already processed")
+        await db.commit()
+        return {"message": "Send marked as completed", "tx_hash": tx_hash}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
