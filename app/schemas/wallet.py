@@ -84,7 +84,8 @@ class WithdrawRequest(BaseModel):
     bank_name: str
     account_name: str
     account_number: str
-    bank_code: Optional[str] = None   # Required for automated transfer
+    bank_code: Optional[str] = None
+    pin_token: Optional[str] = None   # Required for actual submission
 
     @field_validator("amount")
     @classmethod

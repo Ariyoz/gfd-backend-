@@ -396,8 +396,13 @@ async def withdraw(
 ):
     """
     Request a wallet withdrawal to a bank account.
-    Deducts balance immediately; actual transfer processed by admin or automated job.
+    Requires a valid PIN token.
     """
+    # ── PIN gate ──
+    from app.api.v1.endpoints.pin_kyc import require_pin_token
+    pin_token = getattr(payload, "pin_token", None) or ""
+    require_pin_token(pin_token, str(user.id))
+
     wallet = await _get_or_create_wallet(str(user.id), db)
 
     if wallet.get("is_frozen"):
@@ -886,9 +891,13 @@ async def send_money(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Send money to another GFD user by username or email.
-    Atomic: debit sender + credit recipient in one transaction.
+    Send money to another GFD user. Requires PIN token.
     """
+    # ── PIN gate ──
+    from app.api.v1.endpoints.pin_kyc import require_pin_token
+    pin_token = (payload.get("pin_token") or "").strip()
+    require_pin_token(pin_token, str(user.id))
+
     try:
         recipient_id_or_username = payload.get("recipient")  # username or email
         amount = Decimal(str(payload.get("amount", 0)))

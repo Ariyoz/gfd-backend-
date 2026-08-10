@@ -413,16 +413,12 @@ async def send_crypto(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Queue a crypto send from user's GFD balance to an external address.
-
-    Security controls:
-    - Address format validation per coin/network
-    - Balance check with row-level lock
-    - Max send cap per transaction
-    - Idempotency key to prevent duplicate sends
-    - Full audit trail in crypto_transactions
-    - Cannot send to GFD's own deposit addresses
+    Queue a crypto send. Requires a valid PIN token in payload.
     """
+    # ── PIN gate ──
+    from app.api.v1.endpoints.pin_kyc import require_pin_token
+    pin_token = (payload.get("pin_token") or "").strip()
+    require_pin_token(pin_token, str(user.id))
     coin         = (payload.get("coin") or "").lower().strip()
     to_address   = (payload.get("to_address") or "").strip()
     network      = (payload.get("network") or "").strip()

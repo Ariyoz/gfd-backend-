@@ -462,6 +462,54 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"❌ Crypto table migration failed: {e}")
 
+    # ── PIN and KYC tables ────────────────────────────────────────────────────
+    try:
+        from app.database.session import engine
+        from sqlalchemy import text as _pt
+        async with engine.begin() as conn:
+            await conn.execute(_pt("""
+                CREATE TABLE IF NOT EXISTS wallet_pins (
+                    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id         UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    pin_hash        TEXT NOT NULL,
+                    failed_attempts INTEGER DEFAULT 0,
+                    locked_until    TIMESTAMP,
+                    created_at      TIMESTAMP DEFAULT NOW(),
+                    updated_at      TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_wp_user ON wallet_pins(user_id);
+
+                CREATE TABLE IF NOT EXISTS kyc_submissions (
+                    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id         UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    full_name       TEXT NOT NULL,
+                    date_of_birth   TEXT NOT NULL,
+                    country         TEXT NOT NULL,
+                    id_type         TEXT NOT NULL,
+                    id_number       TEXT NOT NULL,
+                    id_front_url    TEXT NOT NULL,
+                    id_back_url     TEXT,
+                    selfie_url      TEXT NOT NULL,
+                    status          TEXT NOT NULL DEFAULT 'pending',
+                    level           INTEGER DEFAULT 1,
+                    reject_reason   TEXT,
+                    reviewed_by     UUID REFERENCES users(id) ON DELETE SET NULL,
+                    reviewed_at     TIMESTAMP,
+                    created_at      TIMESTAMP DEFAULT NOW(),
+                    updated_at      TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_kyc_user   ON kyc_submissions(user_id);
+                CREATE INDEX IF NOT EXISTS idx_kyc_status ON kyc_submissions(status);
+            """))
+            # Add kyc_level column to users if not exists
+            await conn.execute(_pt("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_level INTEGER DEFAULT 0;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS transaction_pin_set BOOLEAN DEFAULT FALSE;
+            """))
+        print("✅ PIN + KYC tables ready")
+    except Exception as e:
+        print(f"❌ PIN/KYC table migration failed: {e}")
+
     # ── Keep-alive: ping self every 10 min so Render free tier stays warm ──
     import asyncio
     import httpx
