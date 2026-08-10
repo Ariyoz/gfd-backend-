@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from uuid import UUID
 
 from app.database import get_db
@@ -16,27 +16,65 @@ router = APIRouter()
 
 @router.get("/me")
 async def get_me(user: User = Depends(get_current_active_user), db: AsyncSession = Depends(get_db)):
-    """Get current user full profile."""
-    # Get follower/following counts
-    followers = (await db.execute(select(func.count()).where(Follow.following_id == user.id))).scalar() or 0
-    following = (await db.execute(select(func.count()).where(Follow.follower_id == user.id))).scalar() or 0
-    post_count = (await db.execute(select(func.count()).where(Post.author_id == user.id))).scalar() or 0
+    """Get current user full profile — single optimised multi-count query."""
+    # One query for all counts instead of 3
+    counts_row = await db.execute(text("""
+        SELECT
+            (SELECT COUNT(*) FROM follows WHERE following_id = CAST(:uid AS UUID)) AS followers,
+            (SELECT COUNT(*) FROM follows WHERE follower_id  = CAST(:uid AS UUID)) AS following,
+            (SELECT COUNT(*) FROM posts  WHERE author_id    = CAST(:uid AS UUID)) AS posts
+    """), {"uid": str(user.id)})
+    counts = counts_row.mappings().first()
+    followers  = int(counts["followers"] or 0)
+    following  = int(counts["following"] or 0)
+    post_count = int(counts["posts"]     or 0)
 
     profile_data = {
-        "id": str(user.id),
-        "email": user.email,
-        "username": user.username,
-        "full_name": user.full_name,
-        "avatar": user.avatar,
-        "banner": user.banner,
-        "role": user.role.value,
-        "is_verified": user.is_verified,
-        "is_online": user.is_online,
+        "id":             str(user.id),
+        "email":          user.email,
+        "username":       user.username,
+        "full_name":      user.full_name,
+        "avatar":         user.avatar,
+        "banner":         user.banner,
+        "role":           user.role.value,
+        "is_verified":    user.is_verified,
+        "is_online":      user.is_online,
         "follower_count": followers,
-        "following_count": following,
-        "post_count": post_count,
-        "created_at": str(user.created_at) if user.created_at else None,
+        "following_count":following,
+        "post_count":     post_count,
+        "created_at":     str(user.created_at) if user.created_at else None,
     }
+
+    dev_result = await db.execute(select(DeveloperProfile).where(DeveloperProfile.user_id == user.id))
+    dev_profile = dev_result.scalar_one_or_none()
+    if dev_profile:
+        profile_data.update({
+            "bio":                 dev_profile.bio,
+            "location":            dev_profile.location,
+            "skills":              dev_profile.skills or [],
+            "tech_stack":          dev_profile.tech_stack or [],
+            "experience_level":    dev_profile.experience_level,
+            "years_of_experience": dev_profile.years_of_experience,
+            "hourly_rate":         dev_profile.hourly_rate,
+            "available_for_hire":  dev_profile.available_for_hire,
+            "github_url":          dev_profile.github_url,
+            "linkedin_url":        dev_profile.linkedin_url,
+            "portfolio_url":       dev_profile.portfolio_url,
+            "website_url":         dev_profile.website_url,
+        })
+
+    client_result = await db.execute(select(ClientProfile).where(ClientProfile.user_id == user.id))
+    client_profile = client_result.scalar_one_or_none()
+    if client_profile:
+        profile_data.update({
+            "company_name": client_profile.company_name,
+            "company_bio":  client_profile.company_bio,
+            "website":      client_profile.website,
+            "location":     client_profile.location,
+            "industry":     client_profile.industry,
+        })
+
+    return profile_data
 
     # Add developer profile if exists
     dev_result = await db.execute(select(DeveloperProfile).where(DeveloperProfile.user_id == user.id))
