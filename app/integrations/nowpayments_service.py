@@ -77,7 +77,7 @@ async def get_deposit_address(coin: str, user_id: str, api_key: str, sandbox: bo
         "coin": coin.upper(),
         "network": coin_meta["network"],
         "payment_id": data.get("payment_id", ""),
-        "qr_code": f"https://chart.googleapis.com/chart?chs=200x200&cht=qr&chl={data.get('pay_address','')}",
+        "qr_code": f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={data.get('pay_address','')}&bgcolor=ffffff&color=000000&margin=10",
         "min_amount": data.get("pay_amount"),
     }
 

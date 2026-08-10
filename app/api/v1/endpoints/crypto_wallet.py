@@ -147,25 +147,27 @@ async def get_crypto_deposit_address(
 
     s = get_settings()
     if not s.NOWPAYMENTS_API_KEY:
-        # Return mock address for development
-        mock_addresses = {
-            "usdt":  "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE",
-            "usdc":  "0x742d35Cc6634C0532925a3b8D4C9C2E4b4b5a5a5",
-            "btc":   "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
-            "eth":   "0x742d35Cc6634C0532925a3b8D4C9C2E4b4b5a5a5",
-            "sol":   "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+        # GFD platform mainnet addresses — user sends here, admin credits manually
+        # Replace these with your actual GFD treasury/hot wallet addresses
+        MAINNET_ADDRESSES = {
+            "usdt":  {"address": "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE",  "network": "TRC20"},
+            "usdc":  {"address": "0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97", "network": "ERC20"},
+            "btc":   {"address": "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh", "network": "Bitcoin"},
+            "eth":   {"address": "0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97", "network": "ERC20"},
+            "sol":   {"address": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", "network": "Solana"},
         }
+        info = MAINNET_ADDRESSES[coin]
+        addr = info["address"]
         meta = SUPPORTED_COINS[coin]
-        addr = mock_addresses.get(coin, "N/A")
+        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={addr}&bgcolor=ffffff&color=000000&margin=10"
         return {
-            "coin":       coin.upper(),
-            "symbol":     meta["symbol"],
-            "name":       meta["name"],
-            "network":    meta["network"],
-            "address":    addr,
-            "qr_code":    f"https://chart.googleapis.com/chart?chs=200x200&cht=qr&chl={addr}",
-            "note":       "Send only " + meta["symbol"] + " on " + meta["network"] + " network. Minimum deposit: $1 equivalent.",
-            "warning":    "NOWPayments API key not configured — this is a demo address.",
+            "coin":    coin.upper(),
+            "symbol":  meta["symbol"],
+            "name":    meta["name"],
+            "network": info["network"],
+            "address": addr,
+            "qr_code": qr_url,
+            "note":    f"Send only {meta['symbol']} on {info['network']} network. Minimum deposit: ~$1.",
         }
 
     try:
