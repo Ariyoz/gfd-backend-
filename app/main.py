@@ -589,13 +589,12 @@ _err_log = _log.getLogger("gfd.errors")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    # Log the REAL error so we can see it in Render logs
     _err_log.error(f"UNHANDLED: {request.method} {request.url.path} → {type(exc).__name__}: {exc}\n{_tb.format_exc()}")
     origin = request.headers.get("origin", "")
     cors_origin = origin if origin in _CORS_ORIGINS else (_CORS_ORIGINS[0] if _CORS_ORIGINS else "*")
     return JSONResponse(
         status_code=500,
-        content={"detail": f"Server error: {type(exc).__name__}: {str(exc)[:200]}"},
+        content={"detail": "Internal server error. Please try again."},
         headers={
             "Access-Control-Allow-Origin": cors_origin,
             "Access-Control-Allow-Credentials": "true",
