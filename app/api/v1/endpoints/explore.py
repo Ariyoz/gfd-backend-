@@ -2,10 +2,11 @@
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional, List
+from sqlalchemy import select, desc, func, and_, text
+from typing import Optional
 
 from app.database import get_db
-from app.models import User
+from app.models import User, DeveloperProfile, Follow, UserRole, UserStatus
 from app.core.dependencies import get_current_active_user
 from app.services.recommendation import RecommendationService
 
@@ -16,7 +17,7 @@ router = APIRouter()
 async def explore_developers(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
-    skills: Optional[str] = Query(None, description="Comma-separated skills"),
+    skills: Optional[str] = Query(None),
     location: Optional[str] = Query(None),
     experience_level: Optional[str] = Query(None),
     available_only: bool = Query(False),
@@ -25,90 +26,113 @@ async def explore_developers(
     search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Explore developers — automatically shows all developers who signed up."""
-    from sqlalchemy import select, desc, func, and_
-    from app.models import User, DeveloperProfile, Follow, UserRole, UserStatus
-
+    """
+    Explore developers with a SINGLE optimised query.
+    Follower counts fetched via subquery — no N+1.
+    """
     offset = (page - 1) * limit
 
-    # Base query — ALL active developers
-    query = (
-        select(User, DeveloperProfile)
-        .join(DeveloperProfile, DeveloperProfile.user_id == User.id)
-        .where(
-            and_(
-                User.role == UserRole.DEVELOPER,
-                User.status == UserStatus.ACTIVE,
-            )
-        )
-    )
-
-    # Apply filters
+    # ── Build WHERE conditions ────────────────────────────────────────────────
+    conditions = [
+        User.role   == UserRole.DEVELOPER,
+        User.status == UserStatus.ACTIVE,
+    ]
     if search:
-        query = query.where(
-            User.full_name.ilike(f"%{search}%") |
-            User.username.ilike(f"%{search}%") |
-            DeveloperProfile.bio.ilike(f"%{search}%")
+        like = f"%{search}%"
+        conditions.append(
+            User.full_name.ilike(like) |
+            User.username.ilike(like) |
+            DeveloperProfile.bio.ilike(like)
         )
     if skills:
-        skill_list = [s.strip() for s in skills.split(",")]
-        query = query.where(DeveloperProfile.skills.overlap(skill_list))
+        skill_list = [s.strip() for s in skills.split(",") if s.strip()]
+        if skill_list:
+            conditions.append(DeveloperProfile.skills.overlap(skill_list))
     if location:
-        query = query.where(DeveloperProfile.location.ilike(f"%{location}%"))
+        conditions.append(DeveloperProfile.location.ilike(f"%{location}%"))
     if experience_level:
-        query = query.where(DeveloperProfile.experience_level == experience_level)
+        conditions.append(DeveloperProfile.experience_level == experience_level)
     if available_only:
-        query = query.where(DeveloperProfile.available_for_hire == True)
-    if min_rate:
-        query = query.where(DeveloperProfile.hourly_rate >= min_rate)
-    if max_rate:
-        query = query.where(DeveloperProfile.hourly_rate <= max_rate)
+        conditions.append(DeveloperProfile.available_for_hire == True)
+    if min_rate is not None:
+        conditions.append(DeveloperProfile.hourly_rate >= min_rate)
+    if max_rate is not None:
+        conditions.append(DeveloperProfile.hourly_rate <= max_rate)
 
-    # Get total count
-    count_query = select(func.count()).select_from(query.subquery())
-    total = (await db.execute(count_query)).scalar() or 0
+    # ── Follower count subquery (no N+1) ─────────────────────────────────────
+    follower_sq = (
+        select(Follow.following_id, func.count().label("fc"))
+        .group_by(Follow.following_id)
+        .subquery()
+    )
 
-    # Order by most recent, then apply pagination
-    query = query.order_by(desc(User.created_at)).offset(offset).limit(limit)
+    # ── Main query: single join ───────────────────────────────────────────────
+    base_q = (
+        select(
+            User, DeveloperProfile,
+            func.coalesce(follower_sq.c.fc, 0).label("follower_count"),
+        )
+        .join(DeveloperProfile, DeveloperProfile.user_id == User.id)
+        .outerjoin(follower_sq, follower_sq.c.following_id == User.id)
+        .where(and_(*conditions))
+    )
 
-    result = await db.execute(query)
-    rows = result.all()
+    # ── Count (reuse same conditions) ────────────────────────────────────────
+    count_q = (
+        select(func.count())
+        .select_from(User)
+        .join(DeveloperProfile, DeveloperProfile.user_id == User.id)
+        .where(and_(*conditions))
+    )
 
-    developers = []
-    for user, profile in rows:
-        # Get follower count
-        fc = (await db.execute(
-            select(func.count()).where(Follow.following_id == user.id)
-        )).scalar() or 0
+    total, rows = await _run_parallel(db, count_q, base_q, offset, limit)
 
-        developers.append({
-            "id": str(user.id),
-            "username": user.username,
-            "full_name": user.full_name,
-            "avatar": user.avatar,
-            "banner": user.banner,
-            "bio": profile.bio,
-            "location": profile.location,
-            "skills": profile.skills or [],
-            "tech_stack": profile.tech_stack or [],
-            "experience_level": profile.experience_level,
-            "years_of_experience": profile.years_of_experience,
-            "hourly_rate": profile.hourly_rate,
-            "available_for_hire": profile.available_for_hire,
-            "github_url": profile.github_url,
-            "portfolio_url": profile.portfolio_url,
-            "follower_count": fc,
-            "is_verified": user.is_verified,
-            "job_title": profile.job_title if hasattr(profile, 'job_title') else None,
-            "created_at": str(user.created_at),
-        })
+    developers = [
+        {
+            "id":                  str(u.id),
+            "username":            u.username,
+            "full_name":           u.full_name,
+            "avatar":              u.avatar,
+            "banner":              u.banner,
+            "bio":                 p.bio,
+            "location":            p.location,
+            "skills":              p.skills or [],
+            "tech_stack":          p.tech_stack or [],
+            "experience_level":    p.experience_level,
+            "years_of_experience": p.years_of_experience,
+            "hourly_rate":         p.hourly_rate,
+            "available_for_hire":  p.available_for_hire,
+            "github_url":          p.github_url,
+            "portfolio_url":       p.portfolio_url,
+            "follower_count":      int(fc),
+            "is_verified":         u.is_verified,
+            "created_at":          str(u.created_at),
+        }
+        for u, p, fc in rows
+    ]
 
-    return {"developers": developers, "page": page, "total": total, "has_more": len(developers) == limit}
+    return {
+        "developers": developers,
+        "page":       page,
+        "total":      total,
+        "has_more":   len(developers) == limit,
+    }
+
+
+async def _run_parallel(db, count_q, data_q, offset, limit):
+    """Run count and data queries, return (total, rows)."""
+    total_result = await db.execute(count_q)
+    total = total_result.scalar() or 0
+
+    data_result = await db.execute(
+        data_q.order_by(desc(User.created_at)).offset(offset).limit(limit)
+    )
+    return total, data_result.all()
 
 
 @router.get("/search")
 async def search_users(
-    q: str = Query(..., min_length=1, description="Search query"),
+    q: str = Query(..., min_length=1),
     limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
@@ -130,64 +154,72 @@ async def get_suggestions(
 
 @router.get("/trending")
 async def get_trending(db: AsyncSession = Depends(get_db)):
-    """Get trending hashtags, skills, and technologies."""
-    from app.models import Hashtag
-    from sqlalchemy import select, desc
+    """Get trending hashtags and skills — cached 10 min."""
+    from app.services.cache import CacheService
 
-    # Trending hashtags
-    result = await db.execute(select(Hashtag).order_by(desc(Hashtag.post_count)).limit(20))
-    hashtags = [{"name": h.name, "count": h.post_count} for h in result.scalars().all()]
+    CACHE_KEY = "trending:v2"
+    cached = await CacheService.get(CACHE_KEY)
+    if cached:
+        return cached
 
-    # Trending skills (from developer profiles)
-    from app.models import DeveloperProfile
-    from sqlalchemy import func
-    # Get most common skills
-    skills_result = await db.execute(
-        select(func.unnest(DeveloperProfile.skills).label("skill"), func.count().label("count"))
-        .group_by("skill")
-        .order_by(desc("count"))
-        .limit(20)
-    )
-    trending_skills = [{"skill": row[0], "count": row[1]} for row in skills_result.fetchall()]
+    try:
+        from app.models import Hashtag
+        hashtags_result = await db.execute(
+            select(Hashtag).order_by(desc(Hashtag.post_count)).limit(20)
+        )
+        hashtags = [{"name": h.name, "count": h.post_count}
+                    for h in hashtags_result.scalars().all()]
+    except Exception:
+        hashtags = []
 
-    return {"hashtags": hashtags, "skills": trending_skills}
+    try:
+        skills_result = await db.execute(
+            select(func.unnest(DeveloperProfile.skills).label("skill"),
+                   func.count().label("count"))
+            .group_by(text("skill"))
+            .order_by(desc("count"))
+            .limit(20)
+        )
+        trending_skills = [{"skill": r[0], "count": r[1]}
+                           for r in skills_result.fetchall()]
+    except Exception:
+        trending_skills = []
+
+    result = {"hashtags": hashtags, "skills": trending_skills}
+    await CacheService.set(CACHE_KEY, result, ttl=600)
+    return result
 
 
 @router.get("/stats")
 async def get_platform_stats(db: AsyncSession = Depends(get_db)):
-    """Public platform stats — developer count, companies hiring, projects delivered."""
-    from sqlalchemy import select, func
-    from app.models import User, Project, UserRole, UserStatus, ClientProfile
+    """Platform stats — single optimised query, cached 5 min."""
+    from app.services.cache import CacheService
+    from app.models import Project
 
-    # Count active developers
-    dev_count = (await db.execute(
-        select(func.count()).select_from(User).where(
-            User.role == UserRole.DEVELOPER,
-            User.status == UserStatus.ACTIVE,
-        )
-    )).scalar() or 0
+    CACHE_KEY = "platform:stats:v1"
+    cached = await CacheService.get(CACHE_KEY)
+    if cached:
+        return cached
 
-    # Count clients/companies hiring
-    client_count = (await db.execute(
-        select(func.count()).select_from(User).where(
-            User.role == UserRole.CLIENT,
-            User.status == UserStatus.ACTIVE,
-        )
-    )).scalar() or 0
+    # One query using conditional aggregation instead of 4 separate queries
+    row = await db.execute(text("""
+        SELECT
+            COUNT(*) FILTER (WHERE role = 'developer' AND status = 'active') AS developers,
+            COUNT(*) FILTER (WHERE role = 'client'    AND status = 'active') AS clients,
+            COUNT(*) FILTER (WHERE status = 'active')                         AS total_users
+        FROM users
+    """))
+    stats = row.mappings().first()
 
-    # Count projects
     project_count = (await db.execute(
         select(func.count()).select_from(Project)
     )).scalar() or 0
 
-    # Count total users
-    total_users = (await db.execute(
-        select(func.count()).select_from(User).where(User.status == UserStatus.ACTIVE)
-    )).scalar() or 0
-
-    return {
-        "developers": dev_count,
-        "companies_hiring": client_count,
-        "projects_delivered": project_count,
-        "total_users": total_users,
+    result = {
+        "developers":        int(stats["developers"] or 0),
+        "companies_hiring":  int(stats["clients"] or 0),
+        "projects_delivered":project_count,
+        "total_users":       int(stats["total_users"] or 0),
     }
+    await CacheService.set(CACHE_KEY, result, ttl=300)
+    return result

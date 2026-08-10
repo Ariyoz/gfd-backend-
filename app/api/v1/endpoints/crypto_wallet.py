@@ -330,10 +330,17 @@ async def nowpayments_webhook(
 @router.get("/prices")
 async def get_crypto_prices():
     """
-    Fetch live USD prices for supported coins from CoinGecko.
+    Fetch live USD prices from CoinGecko — cached 60s to avoid rate limits.
     Falls back to static prices if CoinGecko is unavailable.
     """
     import httpx
+    from app.services.cache import CacheService
+
+    CACHE_KEY = "crypto:prices:v1"
+    cached = await CacheService.get(CACHE_KEY)
+    if cached:
+        return cached
+
     FALLBACK = {"btc": 67000, "eth": 3500, "sol": 145, "usdt": 1.0, "usdc": 1.0}
     COINGECKO_IDS = {
         "btc":  "bitcoin",
@@ -346,7 +353,9 @@ async def get_crypto_prices():
         ids = ",".join(COINGECKO_IDS.values())
         async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.get(
-                f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
+                f"https://api.coingecko.com/api/v3/simple/price"
+                f"?ids={ids}&vs_currencies=usd&include_24hr_change=true",
+                headers={"User-Agent": "GFD-App/1.0"},
             )
         if resp.status_code == 200:
             data = resp.json()
@@ -357,15 +366,18 @@ async def get_crypto_prices():
                     "usd":        entry.get("usd", FALLBACK[coin]),
                     "change_24h": round(entry.get("usd_24h_change", 0), 2),
                 }
-            return {"prices": prices, "source": "coingecko"}
+            result = {"prices": prices, "source": "coingecko"}
+            await CacheService.set(CACHE_KEY, result, ttl=60)
+            return result
     except Exception as e:
         log.warning(f"CoinGecko unavailable: {e}")
 
-    # Fallback
-    return {
+    fallback = {
         "prices": {k: {"usd": v, "change_24h": 0} for k, v in FALLBACK.items()},
         "source": "fallback",
     }
+    await CacheService.set(CACHE_KEY, fallback, ttl=30)
+    return fallback
 
 
 # ── Crypto Send (withdraw to external address) ────────────────────────────────
