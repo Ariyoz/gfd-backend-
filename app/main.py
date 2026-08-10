@@ -583,14 +583,19 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+import traceback as _tb
+import logging as _log
+_err_log = _log.getLogger("gfd.errors")
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    # Log the REAL error so we can see it in Render logs
+    _err_log.error(f"UNHANDLED: {request.method} {request.url.path} → {type(exc).__name__}: {exc}\n{_tb.format_exc()}")
     origin = request.headers.get("origin", "")
-    allowed = _CORS_ORIGINS
-    cors_origin = origin if origin in allowed else (allowed[0] if allowed else "*")
+    cors_origin = origin if origin in _CORS_ORIGINS else (_CORS_ORIGINS[0] if _CORS_ORIGINS else "*")
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error. Please try again."},
+        content={"detail": f"Server error: {type(exc).__name__}: {str(exc)[:200]}"},
         headers={
             "Access-Control-Allow-Origin": cors_origin,
             "Access-Control-Allow-Credentials": "true",
