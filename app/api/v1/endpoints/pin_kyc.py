@@ -284,7 +284,9 @@ async def submit_kyc(
     db: AsyncSession = Depends(get_db),
 ):
     """Submit KYC documents. Files → Cloudinary, URLs stored in DB."""
-    from app.integrations.cloudinary_service import upload_file as cl_upload
+    import cloudinary
+    import cloudinary.uploader
+    from app.config import get_settings as _gs
 
     # Check existing submission
     existing = await db.execute(text("""
@@ -304,32 +306,47 @@ async def submit_kyc(
         raise HTTPException(status_code=400,
             detail=f"Invalid ID type. Use: {sorted(valid_id_types)}")
 
-    allowed_mime = {"image/jpeg", "image/png", "image/webp", "image/heic"}
-    for f in ([id_front, selfie] + ([id_back] if id_back and id_back.filename else [])):
-        if f.content_type not in allowed_mime:
-            raise HTTPException(status_code=400,
-                detail=f"Only JPEG/PNG/WEBP images allowed. Got: {f.content_type}")
-        content = await f.read()
+    allowed_mime = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif", "image/jpg"}
+
+    async def _upload_file(upload: UploadFile, label: str) -> str:
+        """Upload a single file to Cloudinary, return secure URL."""
+        content = await upload.read()
         if len(content) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="File too large. Max 10MB.")
-        await f.seek(0)
+            raise HTTPException(status_code=413, detail=f"{label} too large. Max 10MB.")
+        ct = (upload.content_type or "").lower()
+        # Accept if content_type matches OR if it starts with image/
+        if ct and not ct.startswith("image/"):
+            raise HTTPException(status_code=400,
+                detail=f"Only image files allowed for {label}. Got: {ct}")
+        s = _gs()
+        cloudinary.config(
+            cloud_name=s.CLOUDINARY_CLOUD_NAME,
+            api_key=s.CLOUDINARY_API_KEY,
+            api_secret=s.CLOUDINARY_API_SECRET,
+            secure=True,
+        )
+        uid_short = str(user.id)[:8]
+        result = cloudinary.uploader.upload(
+            content,
+            folder=f"gfd/kyc/{uid_short}",
+            public_id=f"{label}_{uid_short}",
+            resource_type="image",
+            overwrite=True,
+            quality="auto:good",
+        )
+        return result["secure_url"]
 
     try:
-        uid_short = str(user.id)[:8]
-        front_url  = await cl_upload(await id_front.read(),
-                         folder=f"kyc/{uid_short}",
-                         public_id=f"id_front_{uid_short}",
-                         resource_type="image")
-        selfie_url = await cl_upload(await selfie.read(),
-                         folder=f"kyc/{uid_short}",
-                         public_id=f"selfie_{uid_short}",
-                         resource_type="image")
-        back_url = None
+        front_url  = await _upload_file(id_front, "id_front")
+        selfie_url = await _upload_file(selfie, "selfie")
+        back_url   = None
         if id_back and id_back.filename:
-            back_url = await cl_upload(await id_back.read(),
-                           folder=f"kyc/{uid_short}",
-                           public_id=f"id_back_{uid_short}",
-                           resource_type="image")
+            try:
+                back_url = await _upload_file(id_back, "id_back")
+            except Exception:
+                back_url = None  # back is optional — don't fail
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"KYC upload failed: {e}")
         raise HTTPException(status_code=502,
@@ -349,8 +366,8 @@ async def submit_kyc(
               id_back_url=EXCLUDED.id_back_url, selfie_url=EXCLUDED.selfie_url,
               status='pending', reject_reason=NULL, updated_at=NOW()
     """), {
-        "uid": str(user.id), "name": full_name, "dob": date_of_birth,
-        "country": country, "id_type": id_type, "id_num": id_number,
+        "uid": str(user.id), "name": full_name.strip(), "dob": date_of_birth,
+        "country": country, "id_type": id_type, "id_num": id_number.strip(),
         "front": front_url, "back": back_url, "selfie": selfie_url,
     })
     await db.commit()
