@@ -21,7 +21,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 import bcrypt
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
@@ -272,17 +272,122 @@ async def kyc_status(
 
 @kyc_router.post("/submit")
 async def submit_kyc(
-    full_name:     str        = Form(...),
-    date_of_birth: str        = Form(...),
-    country:       str        = Form(...),
-    id_type:       str        = Form(...),
-    id_number:     str        = Form(...),
-    id_front:      UploadFile = File(...),
-    id_back:       UploadFile = File(None),
-    selfie:        UploadFile = File(...),
+    request: Request,
     user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Submit KYC documents.
+    Reads form data directly from the request to handle all multipart edge cases.
+    """
+    import cloudinary
+    import cloudinary.uploader
+    from app.config import get_settings as _gs
+    from fastapi import Request as _Request
+
+    # Parse multipart form manually — more reliable than Form() params
+    try:
+        form = await request.form()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse form data: {e}. Send as multipart/form-data.")
+
+    # Extract text fields
+    full_name     = (form.get("full_name")     or "").strip()
+    date_of_birth = (form.get("date_of_birth") or "").strip()
+    country       = (form.get("country")       or "").strip()
+    id_type       = (form.get("id_type")       or "").strip()
+    id_number     = (form.get("id_number")     or "").strip()
+    id_front_file = form.get("id_front")
+    id_back_file  = form.get("id_back")
+    selfie_file   = form.get("selfie")
+
+    # Validate required fields
+    errors = []
+    if not full_name:     errors.append("full_name is required")
+    if not date_of_birth: errors.append("date_of_birth is required")
+    if not country:       errors.append("country is required")
+    if not id_type:       errors.append("id_type is required")
+    if not id_number:     errors.append("id_number is required")
+    if not id_front_file: errors.append("id_front image is required")
+    if not selfie_file:   errors.append("selfie image is required")
+    if errors:
+        raise HTTPException(status_code=422, detail="; ".join(errors))
+
+    valid_id_types = {"passport", "national_id", "drivers_license", "voters_card"}
+    if id_type not in valid_id_types:
+        raise HTTPException(status_code=400, detail=f"Invalid ID type. Use: {sorted(valid_id_types)}")
+
+    # Check existing submission
+    existing = await db.execute(text("""
+        SELECT status FROM kyc_submissions
+        WHERE user_id = CAST(:uid AS UUID)
+        ORDER BY created_at DESC LIMIT 1
+    """), {"uid": str(user.id)})
+    ex = existing.mappings().first()
+    if ex and ex["status"] in ("pending", "approved"):
+        msg = "Contact support to update." if ex["status"] == "approved" else "Please wait for review."
+        raise HTTPException(status_code=409, detail=f"KYC already {ex['status']}. {msg}")
+
+    async def _upload(upload_file, label: str) -> str:
+        content = await upload_file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail=f"{label} file is empty")
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"{label} too large. Max 10MB.")
+        s = _gs()
+        cloudinary.config(
+            cloud_name=s.CLOUDINARY_CLOUD_NAME,
+            api_key=s.CLOUDINARY_API_KEY,
+            api_secret=s.CLOUDINARY_API_SECRET,
+            secure=True,
+        )
+        uid_short = str(user.id)[:8]
+        result = cloudinary.uploader.upload(
+            content,
+            folder=f"gfd/kyc/{uid_short}",
+            public_id=f"{label}_{uid_short}",
+            resource_type="image",
+            overwrite=True,
+            quality="auto:good",
+        )
+        return result["secure_url"]
+
+    try:
+        front_url  = await _upload(id_front_file, "id_front")
+        selfie_url = await _upload(selfie_file,   "selfie")
+        back_url   = None
+        if id_back_file and hasattr(id_back_file, "read"):
+            try:
+                back_url = await _upload(id_back_file, "id_back")
+            except Exception:
+                back_url = None
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"KYC upload failed: {e}")
+        raise HTTPException(status_code=502, detail="Could not upload documents. Please try again.")
+
+    await db.execute(text("""
+        INSERT INTO kyc_submissions
+          (user_id, full_name, date_of_birth, country, id_type, id_number,
+           id_front_url, id_back_url, selfie_url, status, level, created_at, updated_at)
+        VALUES
+          (CAST(:uid AS UUID), :name, :dob, :country, :id_type, :id_num,
+           :front, :back, :selfie, 'pending', 1, NOW(), NOW())
+        ON CONFLICT (user_id) DO UPDATE
+          SET full_name=EXCLUDED.full_name, date_of_birth=EXCLUDED.date_of_birth,
+              country=EXCLUDED.country, id_type=EXCLUDED.id_type,
+              id_number=EXCLUDED.id_number, id_front_url=EXCLUDED.id_front_url,
+              id_back_url=EXCLUDED.id_back_url, selfie_url=EXCLUDED.selfie_url,
+              status='pending', reject_reason=NULL, updated_at=NOW()
+    """), {
+        "uid":     str(user.id), "name": full_name, "dob": date_of_birth,
+        "country": country,      "id_type": id_type, "id_num": id_number,
+        "front":   front_url,    "back": back_url,   "selfie": selfie_url,
+    })
+    await db.commit()
+    log.info(f"KYC_SUBMITTED user={user.id}")
+    return {"message": "KYC submitted. Review takes 1–2 business days.", "status": "pending"}
     """Submit KYC documents. Files → Cloudinary, URLs stored in DB."""
     import cloudinary
     import cloudinary.uploader
