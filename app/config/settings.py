@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     FLW_PUBLIC_KEY:    str = ""
     FLW_WEBHOOK_HASH:  str = ""  # Set in FLW Dashboard → Settings → Webhooks → Secret Hash
 
+    # ── NOWPayments (Crypto custody — never holds private keys) ──
+    NOWPAYMENTS_API_KEY:      str = ""   # Get from app.nowpayments.io
+    NOWPAYMENTS_IPN_SECRET:   str = ""   # IPN secret for webhook verification
+    NOWPAYMENTS_SANDBOX:      bool = True  # Set False in production
+
     # ── Frontend URL (used for payment callbacks) ──
     FRONTEND_URL: str = "https://www.globalfd.xyz"
 
