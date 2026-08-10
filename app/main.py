@@ -566,13 +566,11 @@ from app.middleware.security import (
     RequestIDMiddleware,
     RequestLoggingMiddleware,
     InputSanitizationMiddleware,
-    RateLimitMiddleware,
     BruteForceMiddleware,
 )
 
 app.add_middleware(InputSanitizationMiddleware)
 app.add_middleware(BruteForceMiddleware)
-app.add_middleware(RateLimitMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
