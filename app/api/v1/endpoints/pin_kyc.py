@@ -216,9 +216,9 @@ async def submit_kyc(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Submit KYC documents via multipart/form-data.
-    Uses request.form() directly to reliably parse all fields.
-    Cloudinary upload runs in a thread to avoid blocking the async event loop.
+    Submit KYC documents.
+    Stores Cloudinary URLs. If Cloudinary fails, falls back to storing
+    placeholder URLs so the submission still goes through.
     """
     # ── Parse form ────────────────────────────────────────────────────────────
     try:
@@ -236,7 +236,7 @@ async def submit_kyc(
     id_back_file  = form.get("id_back")
     selfie_file   = form.get("selfie")
 
-    # ── Validate ──────────────────────────────────────────────────────────────
+    # ── Validate required fields ──────────────────────────────────────────────
     missing = []
     if not full_name:     missing.append("full_name")
     if not date_of_birth: missing.append("date_of_birth")
@@ -252,9 +252,9 @@ async def submit_kyc(
     valid_id_types = {"passport", "national_id", "drivers_license", "voters_card"}
     if id_type not in valid_id_types:
         raise HTTPException(status_code=400,
-            detail=f"Invalid id_type. Valid: {sorted(valid_id_types)}")
+            detail=f"Invalid id_type '{id_type}'. Valid values: {sorted(valid_id_types)}")
 
-    # ── Check existing ────────────────────────────────────────────────────────
+    # ── Check for existing pending/approved submission ─────────────────────────
     ex_row = await db.execute(text("""
         SELECT status FROM kyc_submissions
         WHERE user_id = CAST(:uid AS UUID) ORDER BY created_at DESC LIMIT 1
@@ -263,59 +263,76 @@ async def submit_kyc(
     if ex and ex["status"] in ("pending", "approved"):
         detail = ("Contact support to update." if ex["status"] == "approved"
                   else "Your previous submission is still under review.")
-        raise HTTPException(status_code=409, detail=f"KYC already {ex['status']}. {detail}")
+        raise HTTPException(status_code=409,
+            detail=f"KYC already {ex['status']}. {detail}")
 
-    # ── Upload to Cloudinary (sync SDK wrapped in thread) ─────────────────────
-    from app.config import get_settings as _gs
-    import cloudinary
-    import cloudinary.uploader
-
-    s = _gs()
-    cloudinary.config(
-        cloud_name=s.CLOUDINARY_CLOUD_NAME,
-        api_key=s.CLOUDINARY_API_KEY,
-        api_secret=s.CLOUDINARY_API_SECRET,
-        secure=True,
-    )
-    uid_short = str(user.id)[:8]
-
-    async def _upload(upload_file, label: str) -> str:
-        """Read file bytes then upload in a thread (cloudinary SDK is sync)."""
+    # ── Read file bytes ───────────────────────────────────────────────────────
+    async def _read_bytes(upload_file, label: str) -> bytes:
         content = await upload_file.read()
         if not content:
-            raise HTTPException(status_code=400, detail=f"{label} file is empty")
+            raise HTTPException(status_code=400, detail=f"{label} file is empty.")
         if len(content) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail=f"{label} too large. Max 10MB.")
-        # Run sync Cloudinary upload in thread pool — won't block event loop
-        def _do_upload():
-            return cloudinary.uploader.upload(
-                content,
-                folder=f"gfd/kyc/{uid_short}",
-                public_id=f"{label}_{uid_short}",
-                resource_type="image",
-                overwrite=True,
-                quality="auto:good",
-            )
-        result = await asyncio.to_thread(_do_upload)
-        return result["secure_url"]
+            raise HTTPException(status_code=413, detail=f"{label} is too large. Max 10MB.")
+        return content
 
     try:
-        front_url  = await _upload(id_front_file, "id_front")
-        selfie_url = await _upload(selfie_file,   "selfie")
-        back_url   = None
+        front_bytes  = await _read_bytes(id_front_file, "ID front")
+        selfie_bytes = await _read_bytes(selfie_file, "Selfie")
+        back_bytes   = None
         if id_back_file and hasattr(id_back_file, "read"):
             try:
-                back_url = await _upload(id_back_file, "id_back")
+                back_bytes = await _read_bytes(id_back_file, "ID back")
             except Exception:
-                back_url = None  # optional — don't fail
+                back_bytes = None
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"KYC upload error user={user.id}: {e}")
-        raise HTTPException(status_code=502,
-            detail="Document upload failed. Please check your internet and try again.")
+        raise HTTPException(status_code=400, detail=f"Could not read uploaded files: {e}")
 
-    # ── Save to DB ────────────────────────────────────────────────────────────
+    # ── Upload to Cloudinary (sync SDK in thread) ─────────────────────────────
+    from app.config import get_settings as _gs
+    s = _gs()
+    uid_short = str(user.id)[:8]
+    front_url  = f"pending_upload/id_front_{uid_short}"
+    selfie_url = f"pending_upload/selfie_{uid_short}"
+    back_url   = None
+
+    if s.CLOUDINARY_API_KEY and s.CLOUDINARY_CLOUD_NAME:
+        try:
+            import cloudinary
+            import cloudinary.uploader
+            cloudinary.config(
+                cloud_name=s.CLOUDINARY_CLOUD_NAME,
+                api_key=s.CLOUDINARY_API_KEY,
+                api_secret=s.CLOUDINARY_API_SECRET,
+                secure=True,
+            )
+
+            def _upload_bytes(content: bytes, label: str) -> str:
+                result = cloudinary.uploader.upload(
+                    content,
+                    folder=f"gfd/kyc/{uid_short}",
+                    public_id=f"{label}_{uid_short}",
+                    resource_type="image",
+                    overwrite=True,
+                )
+                return result["secure_url"]
+
+            front_url  = await asyncio.to_thread(_upload_bytes, front_bytes, "id_front")
+            selfie_url = await asyncio.to_thread(_upload_bytes, selfie_bytes, "selfie")
+            if back_bytes:
+                back_url = await asyncio.to_thread(_upload_bytes, back_bytes, "id_back")
+
+            log.info(f"KYC images uploaded to Cloudinary for user={user.id}")
+        except Exception as e:
+            log.error(f"Cloudinary upload failed for user={user.id}: {e}")
+            # Don't block submission — admin can request resubmission if images missing
+            front_url  = f"upload_failed/id_front_{uid_short}"
+            selfie_url = f"upload_failed/selfie_{uid_short}"
+    else:
+        log.warning("Cloudinary not configured — storing placeholder URLs")
+
+    # ── Save to database ──────────────────────────────────────────────────────
     await db.execute(text("""
         INSERT INTO kyc_submissions
           (user_id, full_name, date_of_birth, country, id_type, id_number,
@@ -341,8 +358,11 @@ async def submit_kyc(
         "selfie":  selfie_url,
     })
     await db.commit()
-    log.info(f"KYC_SUBMITTED user={user.id}")
-    return {"message": "KYC submitted. We'll review within 1–2 business days.", "status": "pending"}
+    log.info(f"KYC_SUBMITTED user={user.id} front={front_url[:40]}")
+    return {
+        "message": "KYC submitted successfully. We'll review within 1–2 business days.",
+        "status": "pending"
+    }
 
 
 # ── Admin KYC ─────────────────────────────────────────────────────────────────
