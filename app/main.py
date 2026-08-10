@@ -476,9 +476,10 @@ async def lifespan(app: FastAPI):
                     locked_until    TIMESTAMP,
                     created_at      TIMESTAMP DEFAULT NOW(),
                     updated_at      TIMESTAMP DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS idx_wp_user ON wallet_pins(user_id);
-
+                )
+            """))
+            await conn.execute(_pt("CREATE INDEX IF NOT EXISTS idx_wp_user ON wallet_pins(user_id)"))
+            await conn.execute(_pt("""
                 CREATE TABLE IF NOT EXISTS kyc_submissions (
                     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     user_id         UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -497,18 +498,16 @@ async def lifespan(app: FastAPI):
                     reviewed_at     TIMESTAMP,
                     created_at      TIMESTAMP DEFAULT NOW(),
                     updated_at      TIMESTAMP DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS idx_kyc_user   ON kyc_submissions(user_id);
-                CREATE INDEX IF NOT EXISTS idx_kyc_status ON kyc_submissions(status);
+                )
             """))
-            # Add kyc_level column to users if not exists
-            await conn.execute(_pt("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_level INTEGER DEFAULT 0;
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS transaction_pin_set BOOLEAN DEFAULT FALSE;
-            """))
+            await conn.execute(_pt("CREATE INDEX IF NOT EXISTS idx_kyc_user   ON kyc_submissions(user_id)"))
+            await conn.execute(_pt("CREATE INDEX IF NOT EXISTS idx_kyc_status ON kyc_submissions(status)"))
+            await conn.execute(_pt("ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_level INTEGER DEFAULT 0"))
+            await conn.execute(_pt("ALTER TABLE users ADD COLUMN IF NOT EXISTS transaction_pin_set BOOLEAN DEFAULT FALSE"))
         print("✅ PIN + KYC tables ready")
     except Exception as e:
         print(f"❌ PIN/KYC table migration failed: {e}")
+        import traceback; traceback.print_exc()
 
     # ── Keep-alive: ping self every 10 min so Render free tier stays warm ──
     import asyncio
