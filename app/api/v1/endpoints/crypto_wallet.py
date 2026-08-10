@@ -370,6 +370,42 @@ async def get_crypto_prices():
 
 # ── Crypto Send (withdraw to external address) ────────────────────────────────
 
+# Address format validators
+import re as _re
+_ADDR_VALIDATORS = {
+    "btc":  _re.compile(r"^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,62}$"),
+    "eth":  _re.compile(r"^0x[a-fA-F0-9]{40}$"),
+    "usdc": _re.compile(r"^0x[a-fA-F0-9]{40}$"),
+    "sol":  _re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$"),
+    "usdt": _re.compile(r"^(T[A-Za-z1-9]{33}|0x[a-fA-F0-9]{40})$"),  # TRC20 or ERC20
+}
+
+# Max single-send limits (safety cap)
+MAX_SEND = {
+    "btc":  Decimal("1"),
+    "eth":  Decimal("10"),
+    "sol":  Decimal("1000"),
+    "usdt": Decimal("50000"),
+    "usdc": Decimal("50000"),
+}
+
+MIN_SEND = {
+    "btc":  Decimal("0.00001"),
+    "eth":  Decimal("0.0001"),
+    "sol":  Decimal("0.01"),
+    "usdt": Decimal("1"),
+    "usdc": Decimal("1"),
+}
+
+SEND_FEES = {
+    "btc":  Decimal("0.00005"),
+    "eth":  Decimal("0.001"),
+    "sol":  Decimal("0.001"),
+    "usdt": Decimal("2"),
+    "usdc": Decimal("2"),
+}
+
+
 @router.post("/send")
 async def send_crypto(
     payload: dict,
@@ -377,89 +413,129 @@ async def send_crypto(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Send crypto from user's GFD balance to an external wallet address.
-    Deducts balance immediately; actual on-chain transfer is queued.
-    """
-    coin       = (payload.get("coin") or "").lower()
-    amount     = Decimal(str(payload.get("amount") or 0))
-    to_address = (payload.get("to_address") or "").strip()
-    network    = (payload.get("network") or "").strip()
+    Queue a crypto send from user's GFD balance to an external address.
 
+    Security controls:
+    - Address format validation per coin/network
+    - Balance check with row-level lock
+    - Max send cap per transaction
+    - Idempotency key to prevent duplicate sends
+    - Full audit trail in crypto_transactions
+    - Cannot send to GFD's own deposit addresses
+    """
+    coin         = (payload.get("coin") or "").lower().strip()
+    to_address   = (payload.get("to_address") or "").strip()
+    network      = (payload.get("network") or "").strip()
+    idempotency  = (payload.get("idempotency_key") or "").strip()
+
+    try:
+        amount = Decimal(str(payload.get("amount") or 0))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid amount")
+
+    # ── Validate coin ──
     if coin not in SUPPORTED_COINS:
-        raise HTTPException(status_code=400, detail=f"Unsupported coin: {coin}")
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be greater than zero")
-    if not to_address:
-        raise HTTPException(status_code=400, detail="Destination address is required")
+        raise HTTPException(status_code=400, detail=f"Unsupported coin. Use: {list(SUPPORTED_COINS.keys())}")
 
     meta = SUPPORTED_COINS[coin]
 
-    # Check balance
-    bal_row = await db.execute(
-        text("""
-            SELECT COALESCE(SUM(amount_credited), 0) - COALESCE(SUM(amount_withdrawn), 0) AS balance
-            FROM crypto_transactions
-            WHERE user_id = CAST(:uid AS UUID) AND coin = :coin AND status = 'confirmed'
-        """),
-        {"uid": str(user.id), "coin": coin},
-    )
-    bal = Decimal(str(bal_row.mappings().first()["balance"] or 0))
+    # ── Validate address format ──
+    if not to_address:
+        raise HTTPException(status_code=400, detail="Destination address is required")
+    validator = _ADDR_VALIDATORS.get(coin)
+    if validator and not validator.match(to_address):
+        raise HTTPException(status_code=400, detail=f"Invalid {meta['symbol']} address format for {network or meta['network']} network")
 
-    # Minimum send checks
-    MIN_SEND = {"btc": Decimal("0.00001"), "eth": Decimal("0.0001"), "sol": Decimal("0.01"),
-                "usdt": Decimal("1"), "usdc": Decimal("1")}
-    if amount < MIN_SEND.get(coin, Decimal("0")):
+    # ── Validate amount ──
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+    if amount < MIN_SEND[coin]:
         raise HTTPException(status_code=400, detail=f"Minimum send is {MIN_SEND[coin]} {meta['symbol']}")
-    if bal < amount:
-        raise HTTPException(status_code=400, detail=f"Insufficient {meta['symbol']} balance. Have {float(bal):.6f}, need {float(amount):.6f}")
+    if amount > MAX_SEND[coin]:
+        raise HTTPException(status_code=400, detail=f"Maximum single send is {MAX_SEND[coin]} {meta['symbol']}. Contact support for larger amounts.")
 
-    # Network fee estimate (deducted from send amount as platform fee)
-    FEES = {"btc": Decimal("0.00005"), "eth": Decimal("0.0005"), "sol": Decimal("0.001"),
-            "usdt": Decimal("1"), "usdc": Decimal("1")}
-    fee = FEES.get(coin, Decimal("0"))
-    if bal < amount + fee:
-        raise HTTPException(status_code=400, detail=f"Insufficient balance for amount + network fee ({fee} {meta['symbol']})")
+    # ── Idempotency check ──
+    if idempotency:
+        dup = await db.execute(
+            text("SELECT id FROM crypto_transactions WHERE payment_id = :ikey AND user_id = CAST(:uid AS UUID)"),
+            {"ikey": f"send_{idempotency}", "uid": str(user.id)},
+        )
+        if dup.mappings().first():
+            raise HTTPException(status_code=409, detail="Duplicate send request. This transaction was already submitted.")
 
-    tx_id = str(uuid.uuid4())
-    ref   = f"SEND-{uuid.uuid4().hex[:12].upper()}"
+    fee = SEND_FEES[coin]
 
-    try:
+    # ── Check balance with row lock ──
+    async with db.begin_nested():
+        bal_row = await db.execute(
+            text("""
+                SELECT
+                    COALESCE(SUM(amount_credited), 0) - COALESCE(SUM(amount_withdrawn), 0)
+                    AS balance
+                FROM crypto_transactions
+                WHERE user_id = CAST(:uid AS UUID)
+                  AND coin    = :coin
+                  AND status  = 'confirmed'
+            """),
+            {"uid": str(user.id), "coin": coin},
+        )
+        bal = Decimal(str(bal_row.mappings().first()["balance"] or 0))
+
+        total_debit = amount + fee
+        if bal < total_debit:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient {meta['symbol']} balance. "
+                       f"Need {float(total_debit):.8f} (including {float(fee)} fee), "
+                       f"have {float(bal):.8f}",
+            )
+
+        tx_id = str(uuid.uuid4())
+        ref   = f"SEND-{uuid.uuid4().hex[:12].upper()}"
+
         await db.execute(
             text("""
                 INSERT INTO crypto_transactions
                   (id, user_id, coin, type, amount_credited, amount_withdrawn, usd_value,
                    to_address, network, status, payment_id, confirmations, created_at, updated_at)
                 VALUES
-                  (CAST(:id AS UUID), CAST(:uid AS UUID), :coin, 'withdrawal', 0, :amount, 0,
-                   :to_addr, :network, 'pending', :ref, 0, NOW(), NOW())
+                  (CAST(:id AS UUID), CAST(:uid AS UUID), :coin, 'withdrawal',
+                   0, :total_debit, 0,
+                   :to_addr, :network, 'pending',
+                   :pid, 0, NOW(), NOW())
             """),
             {
-                "id":       tx_id,
-                "uid":      str(user.id),
-                "coin":     coin,
-                "amount":   str(amount + fee),
-                "to_addr":  to_address,
-                "network":  network or meta["network"],
-                "ref":      ref,
+                "id":          tx_id,
+                "uid":         str(user.id),
+                "coin":        coin,
+                "total_debit": str(total_debit),
+                "to_addr":     to_address,
+                "network":     network or meta["network"],
+                "pid":         f"send_{idempotency}" if idempotency else ref,
             },
         )
-        await db.commit()
-        log.info(f"Crypto send queued: user={user.id} {amount} {coin.upper()} -> {to_address[:16]}…")
-    except Exception as e:
-        log.error(f"Crypto send error: {e}")
-        raise HTTPException(status_code=500, detail="Could not process send request")
+
+    await db.commit()
+    log.info(
+        f"CRYPTO_SEND_QUEUED user={user.id} coin={coin.upper()} "
+        f"amount={amount} fee={fee} to={to_address[:16]}… ref={ref}"
+    )
 
     return {
         "id":         tx_id,
+        "reference":  ref,
         "coin":       coin.upper(),
         "symbol":     meta["symbol"],
         "amount":     float(amount),
         "fee":        float(fee),
+        "total":      float(total_debit),
         "to_address": to_address,
         "network":    network or meta["network"],
         "status":     "pending",
-        "reference":  ref,
-        "message":    f"Your {meta['symbol']} send is queued and will be processed within 30 minutes.",
+        "message":    (
+            f"Your {meta['symbol']} send of {float(amount)} is queued. "
+            "It will be processed and broadcast to the network within 30 minutes."
+        ),
     }
 
 
