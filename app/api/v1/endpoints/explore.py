@@ -207,10 +207,11 @@ async def get_platform_stats(db: AsyncSession = Depends(get_db)):
         # Use CAST to text to handle both enum and varchar status columns
         row = await db.execute(text("""
             SELECT
-                COUNT(*) FILTER (WHERE role::text = 'developer' AND status::text IN ('active','ACTIVE')) AS developers,
-                COUNT(*) FILTER (WHERE role::text = 'client'    AND status::text IN ('active','ACTIVE')) AS clients,
-                COUNT(*) FILTER (WHERE status::text IN ('active','ACTIVE','pending_verification','PENDING_VERIFICATION')) AS total_users
+                COUNT(*) FILTER (WHERE role::text IN ('developer','DEVELOPER')) AS developers,
+                COUNT(*) FILTER (WHERE role::text IN ('client','CLIENT'))       AS clients,
+                COUNT(*) AS total_users
             FROM users
+            WHERE status::text NOT IN ('suspended','SUSPENDED','deactivated','DEACTIVATED')
         """))
         stats = row.mappings().first()
 
