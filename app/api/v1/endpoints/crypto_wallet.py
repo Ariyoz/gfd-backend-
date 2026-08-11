@@ -16,7 +16,7 @@ from sqlalchemy import text
 
 from app.database import get_db
 from app.models import User
-from app.core.dependencies import get_current_active_user
+from app.core.dependencies import get_current_active_user, require_admin
 from app.config import get_settings
 from app.integrations.nowpayments_service import (
     SUPPORTED_COINS,
@@ -552,8 +552,8 @@ async def send_crypto(
 @router.get("/admin/overview")
 async def admin_crypto_overview(
     db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
 ):
-    """Admin — total crypto holdings and recent activity (no auth for internal use — protect via middleware)."""
     try:
         # Total per coin
         rows = await db.execute(text("""
@@ -638,6 +638,7 @@ async def admin_crypto_transactions(
     tx_type: str = None,
     status: str = None,
     db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
 ):
     """Admin — paginated crypto transactions with filters."""
     try:

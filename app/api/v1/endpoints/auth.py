@@ -204,6 +204,30 @@ async def delete_own_account(
     return {"message": "Account permanently deleted"}
 
 
+@router.post("/change-password", status_code=status.HTTP_200_OK)
+async def change_password(
+    data: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Change password — requires current password."""
+    current_password = data.get("current_password", "")
+    new_password     = data.get("new_password", "")
+
+    if not current_password or not new_password:
+        raise HTTPException(status_code=400, detail="current_password and new_password are required")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+    if not user.hashed_password:
+        raise HTTPException(status_code=400, detail="Account uses OAuth login. Set a password via Forgot Password.")
+    if not verify_password(current_password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    user.hashed_password = hash_password(new_password)
+    await db.commit()
+    return {"message": "Password updated successfully"}
+
+
 @router.post("/forgot-password", status_code=status.HTTP_200_OK)
 async def forgot_password(data: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
     """Send password reset email."""
