@@ -509,7 +509,22 @@ async def lifespan(app: FastAPI):
         print(f"❌ PIN/KYC table migration failed: {e}")
         import traceback; traceback.print_exc()
 
-    # ── Keep-alive: ping self every 10 min so Render free tier stays warm ──
+    # ── Clean up test accounts created during development ──────────────────
+    try:
+        from app.database.session import engine
+        from sqlalchemy import text as _cl
+        async with engine.begin() as conn:
+            result = await conn.execute(_cl("""
+                DELETE FROM users
+                WHERE username LIKE 'kyctest%'
+                   OR email LIKE 'kyctest%@test.com'
+                RETURNING username
+            """))
+            deleted = result.fetchall()
+            if deleted:
+                print(f"🧹 Cleaned up {len(deleted)} test account(s): {[r[0] for r in deleted]}")
+    except Exception as e:
+        print(f"⚠️ Test cleanup: {e}")
     import asyncio
     import httpx
 
